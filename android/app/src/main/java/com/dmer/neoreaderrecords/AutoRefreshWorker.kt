@@ -3,20 +3,26 @@ package com.dmer.neoreaderrecords
 import android.content.Context
 import android.net.Uri
 import androidx.work.Constraints
+import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
-import androidx.work.Worker
 import androidx.work.WorkerParameters
+import kotlinx.coroutines.delay
 
-class AutoRefreshWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
-    override fun doWork(): Result {
+class AutoRefreshWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
+    override suspend fun doWork(): Result {
         AutoRefreshLog.i(applicationContext, "Worker.doWork start")
         if (!AutoRefreshConfig.isEnabled(applicationContext)) return Result.success()
         val reason = inputData.getString("reason") ?: "unknown"
         AutoRefreshLog.i(applicationContext, "Worker reason=$reason")
+
+        if (AutoRefreshReasonPolicy.needsLocalSettleDelay(reason)) {
+            AutoRefreshLog.i(applicationContext, "Worker wait for Neo provider settle reason=$reason")
+            delay(1_200L)
+        }
         
         val prefs = applicationContext.getSharedPreferences(AutoRefreshConfig.PREFS_NAME, Context.MODE_PRIVATE)
         val wallpaperMode = prefs.getString("wallpaper_mode", "STATS") ?: "STATS"
@@ -47,11 +53,8 @@ class AutoRefreshWorker(context: Context, params: WorkerParameters) : Worker(con
         val lastMs = prefs.getLong(AutoRefreshConfig.KEY_LAST_TRIGGER_MS, 0L)
         val delta = now - lastMs
 
-        if (sourceMode == "WEREAD" || sourceMode == "MIXED") {
-            val remoteAllowed = reason == "screen_on_prewarm" ||
-                reason == "user_present_prewarm" ||
-                reason == "daily_alarm"
-            if (!remoteAllowed) {
+        if (AutoRefreshReasonPolicy.isRemoteSource(sourceMode)) {
+            if (!AutoRefreshReasonPolicy.isRemoteTrigger(reason)) {
                 AutoRefreshLog.i(applicationContext, "Worker skip remote source=$sourceMode on reason=$reason")
                 return Result.success()
             }
@@ -75,27 +78,38 @@ class AutoRefreshWorker(context: Context, params: WorkerParameters) : Worker(con
                 AutoRefreshLog.i(applicationContext, "Worker success saved remote source=$sourceMode")
                 return Result.success()
             }
-            AutoRefreshLog.i(applicationContext, "Worker remote failed -> retry source=$sourceMode")
-            return Result.retry()
+            AutoRefreshLog.i(
+                applicationContext,
+                "Worker remote failed after internal retries; wait for next trigger source=$sourceMode"
+            )
+            return Result.failure()
         }
 
         var shouldGenerate = true
         var latestBookKey = ""
 
-        if (wallpaperMode == "COVER") {
-            // 封面模式：基于最新阅读书籍标识进行防抖（书没变绝不生成，书变了无视时间立刻生成）
+        if (wallpaperMode == "COVER" || wallpaperMode == "AUTO_COVER") {
+            // 封面模式按最新书籍防抖；元数据变化仍允许同一本书重新提取封面。
             latestBookKey = getLatestBookIdentifier(applicationContext)
             val lastBookKey = prefs.getString("auto_last_book_key", "") ?: ""
             if (latestBookKey.isNotBlank() && latestBookKey == lastBookKey) {
-                AutoRefreshLog.i(applicationContext, "Worker skip: COVER mode book unchanged ($latestBookKey)")
-                shouldGenerate = false
+                shouldGenerate = AutoRefreshReasonPolicy.shouldRefreshUnchangedCover(
+                    wallpaperMode = wallpaperMode,
+                    reason = reason,
+                    minIntervalElapsed = delta >= minIntervalMs
+                )
+                AutoRefreshLog.i(
+                    applicationContext,
+                    "Worker cover unchanged ($latestBookKey) mode=$wallpaperMode fallbackStatsDue=$shouldGenerate"
+                )
             } else {
                 AutoRefreshLog.i(applicationContext, "Worker force generation: book changed from [$lastBookKey] to [$latestBookKey]")
                 shouldGenerate = true
             }
         } else {
             // 统计模式：基于配置的时间进行严格防抖
-            if (delta < minIntervalMs) {
+            val contentDriven = reason == "book_content_changed" || reason == "reading_stats_changed"
+            if (!contentDriven && delta < minIntervalMs) {
                 AutoRefreshLog.i(applicationContext, "Worker skip by debounce: delta=${delta}ms < $minIntervalMs ms")
                 shouldGenerate = false
             } else {
@@ -121,17 +135,18 @@ class AutoRefreshWorker(context: Context, params: WorkerParameters) : Worker(con
         return Result.retry()
     }
 
-    private fun runRemoteWithNetworkRetries(reason: String, sourceMode: String): Boolean {
-        val maxAttempts = 5
-        val firstDelayMs = 3_500L
-        val retryDelayMs = 3_000L
+    private suspend fun runRemoteWithNetworkRetries(reason: String, sourceMode: String): Boolean {
+        val maxAttempts = 3
+        val firstDelayMs = 1_500L
+        val retryDelayMs = 2_000L
         for (attempt in 1..maxAttempts) {
+            if (isStopped) return false
             val delayMs = if (attempt == 1) firstDelayMs else retryDelayMs
             AutoRefreshLog.i(
                 applicationContext,
                 "Worker remote wait network settle ${delayMs}ms before request source=$sourceMode attempt=$attempt/$maxAttempts"
             )
-            Thread.sleep(delayMs)
+            delay(delayMs)
             val taggedReason = "$reason#$attempt"
             val ok = if (sourceMode == "MIXED") {
                 AutoWallpaperGenerator.generateAndSaveMixed(applicationContext, taggedReason)
@@ -166,18 +181,31 @@ class AutoRefreshWorker(context: Context, params: WorkerParameters) : Worker(con
 
     companion object {
         fun enqueue(context: Context, reason: String) {
+            val prefs = context.getSharedPreferences(AutoRefreshConfig.PREFS_NAME, Context.MODE_PRIVATE)
+            val sourceMode = prefs.getString("source_mode", "DURATION") ?: "DURATION"
+            val remoteSource = AutoRefreshReasonPolicy.isRemoteSource(sourceMode)
+            if (remoteSource && !AutoRefreshReasonPolicy.isRemoteTrigger(reason)) {
+                AutoRefreshLog.i(context, "Worker enqueue skip remote source=$sourceMode reason=$reason")
+                return
+            }
             val req = OneTimeWorkRequestBuilder<AutoRefreshWorker>()
                 .setInputData(androidx.work.Data.Builder().putString("reason", reason).build())
                 .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                 .setConstraints(
                     Constraints.Builder()
-                        .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
+                        .setRequiredNetworkType(
+                            if (remoteSource) NetworkType.CONNECTED else NetworkType.NOT_REQUIRED
+                        )
                         .build()
                 )
                 .build()
             WorkManager.getInstance(context).enqueueUniqueWork(
-                "neoreader_auto_refresh",
-                ExistingWorkPolicy.REPLACE,
+                if (remoteSource) {
+                    AutoRefreshReasonPolicy.REMOTE_WORK_NAME
+                } else {
+                    AutoRefreshReasonPolicy.LOCAL_WORK_NAME
+                },
+                if (remoteSource) ExistingWorkPolicy.KEEP else ExistingWorkPolicy.REPLACE,
                 req
             )
         }

@@ -13,6 +13,8 @@ import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.provider.DocumentsContract
 import android.view.Gravity
 import android.view.View
@@ -30,7 +32,6 @@ import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.GridLayout
 import android.widget.ImageView
-import android.widget.SeekBar
 import android.widget.LinearLayout
 import android.widget.RadioButton
 import android.widget.RadioGroup
@@ -44,7 +45,6 @@ import com.google.zxing.EncodeHintType
 import com.google.zxing.MultiFormatWriter
 import com.google.zxing.common.BitMatrix
 import java.io.File
-import java.io.FileOutputStream
 import java.io.FileWriter
 import java.net.HttpURLConnection
 import java.net.URL
@@ -53,12 +53,14 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
     companion object {
         private const val FONT_ENTRY_SEP = "@@"
         private const val SPONSOR_QR_URL = "https://dmer.work:15060/images/2026/07/01/IMG_7329_neutral.JPG.png"
         private const val XHS_PROFILE_URL = "https://xhslink.com/m/1QDye14ktkf"
+        private const val PREVIEW_DEBOUNCE_MS = 800L
     }
 
     private class SimpleItemSelectedListener(val onChange: () -> Unit) : AdapterView.OnItemSelectedListener {
@@ -111,6 +113,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var autoMinIntervalInput: EditText
     private lateinit var autoModeHintText: TextView
     private lateinit var autoStateText: TextView
+    private lateinit var autoExactAlarmButton: Button
     private lateinit var updateStatusText: TextView
     private lateinit var wereadApiKeyInput: EditText
     private lateinit var wereadStatsModeGroup: RadioGroup
@@ -150,6 +153,17 @@ class MainActivity : ComponentActivity() {
     private var lastWeReadWallpaperDebug: String = ""
     private val debugLogName = "neoreader_debug_log.txt"
     private var selectedFontDirUri: String? = null
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val previewExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "wallpaper-preview").apply { isDaemon = true }
+    }
+    private val debugExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "wallpaper-debug").apply { isDaemon = true }
+    }
+    private var previewDebounceRunnable: Runnable? = null
+    @Volatile private var previewRequestId: Int = 0
+    private var isApplyingSettings: Boolean = false
+    private var autoRuntimeInitialized: Boolean = false
 
     private val pickFontTreeLauncher = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) {
@@ -173,7 +187,6 @@ class MainActivity : ComponentActivity() {
         val path: String,
         val title: String,
         val author: String,
-        val lastAccessMs: Long,
         val hasCoverHint: Boolean
     )
     private data class CalendarDayStat(
@@ -239,6 +252,19 @@ class MainActivity : ComponentActivity() {
         setupUi()
     }
 
+    override fun onDestroy() {
+        previewRequestId += 1
+        previewDebounceRunnable?.let(uiHandler::removeCallbacks)
+        previewDebounceRunnable = null
+        previewExecutor.shutdownNow()
+        debugExecutor.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun dp(value: Int): Int {
+        return (value * resources.displayMetrics.density + 0.5f).toInt()
+    }
+
     private fun checkAllFilesAccessPermission() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             if (!android.os.Environment.isExternalStorageManager()) {
@@ -260,6 +286,12 @@ class MainActivity : ComponentActivity() {
         if (!isInitializingUi) {
             validateFontTreePermission()
             reloadFontsFromSources()
+            if (
+                AutoRefreshConfig.isEnabled(this) &&
+                AutoRefreshConfig.mode(this) == AutoRefreshConfig.MODE_DAILY
+            ) {
+                AutoRefreshScheduler.reschedule(this)
+            }
             updateAutoRuntimeState()
             updateReleaseStatusFromCache()
             checkForUpdatesIfNeeded(force = false)
@@ -342,10 +374,10 @@ class MainActivity : ComponentActivity() {
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(24, 24, 24, 24)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
             setBackgroundColor(Color.WHITE)
         }
-        fun inkBorder(stroke: Int = 4, fill: Int = Color.WHITE): GradientDrawable {
+        fun inkBorder(stroke: Int = dp(2), fill: Int = Color.WHITE): GradientDrawable {
             return GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 setColor(fill)
@@ -358,7 +390,8 @@ class MainActivity : ComponentActivity() {
                 textSize = 18f
                 gravity = Gravity.CENTER
                 setTypeface(Typeface.DEFAULT_BOLD)
-                setPadding(12, 22, 12, 22)
+                minimumHeight = dp(56)
+                setPadding(dp(6), dp(8), dp(6), dp(8))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                 setOnClickListener {
                     currentPageKey = key
@@ -373,25 +406,26 @@ class MainActivity : ComponentActivity() {
                 gravity = Gravity.CENTER
                 setTypeface(Typeface.DEFAULT_BOLD)
                 setTextColor(if (primary) Color.WHITE else Color.BLACK)
-                background = inkBorder(4, if (primary) Color.BLACK else Color.WHITE)
-                setPadding(12, 22, 12, 22)
+                background = inkBorder(dp(2), if (primary) Color.BLACK else Color.WHITE)
+                minimumHeight = dp(56)
+                setPadding(dp(6), dp(8), dp(6), dp(8))
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
-                    setMargins(0, 0, 12, 0)
+                    setMargins(0, 0, dp(6), 0)
                 }
                 setOnClickListener { onTap() }
             }
         }
         fun dividerVertical(): View = View(this).apply {
             setBackgroundColor(Color.BLACK)
-            layoutParams = LinearLayout.LayoutParams(4, ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = LinearLayout.LayoutParams(dp(2), ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
         val navGroup = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            background = inkBorder(4)
+            background = inkBorder()
             setPadding(0, 0, 0, 0)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                setMargins(0, 0, 0, 16)
+                setMargins(0, 0, 0, dp(8))
             }
         }
         val navSettings = makeNavItem("设置", "settings") { showSettingsPage() }
@@ -413,15 +447,18 @@ class MainActivity : ComponentActivity() {
         changeStateText = TextView(this).apply {
             text = "状态：初始化"
             textSize = 13f
-            setPadding(4, 0, 4, 18)
+            setPadding(dp(2), 0, dp(2), dp(9))
             setTextColor(Color.DKGRAY)
         }
         updateTopNavState = {
-            val items = listOf("settings" to navSettings, "preview" to navPreview)
-            items.forEach { (key, item) ->
+            val items = listOf(Triple("settings", "设置", navSettings), Triple("preview", "预览", navPreview))
+            items.forEach { (key, label, item) ->
                 val selected = currentPageKey == key
-                item.setTextColor(if (selected) Color.WHITE else Color.BLACK)
-                item.setBackgroundColor(if (selected) Color.BLACK else Color.TRANSPARENT)
+                item.text = "${if (selected) "●" else "○"} $label"
+                item.setTextColor(Color.BLACK)
+                item.setBackgroundColor(Color.WHITE)
+                item.setTypeface(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
+                item.contentDescription = "$label，${if (selected) "当前页面" else "点击打开"}"
             }
         }
 
@@ -549,14 +586,14 @@ class MainActivity : ComponentActivity() {
         val scroll = ScrollView(this).apply { setBackgroundColor(Color.WHITE) }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(32, 40, 32, 80)
+            setPadding(dp(20), dp(24), dp(20), dp(48))
         }
         val hiddenHost = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
 
-        fun inkBorder(stroke: Int = 4): GradientDrawable {
+        fun inkBorder(stroke: Int = dp(2)): GradientDrawable {
             return GradientDrawable().apply {
                 shape = GradientDrawable.RECTANGLE
                 setColor(Color.WHITE)
@@ -564,7 +601,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        fun createDivider(thickness: Int = 4, topMargin: Int = 0, bottomMargin: Int = 24) = View(this).apply {
+        fun createDivider(thickness: Int = dp(2), topMargin: Int = 0, bottomMargin: Int = dp(16)) = View(this).apply {
             setBackgroundColor(Color.BLACK)
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thickness).apply {
                 setMargins(0, topMargin, 0, bottomMargin)
@@ -577,17 +614,17 @@ class MainActivity : ComponentActivity() {
                 textSize = 24f
                 setTextColor(Color.BLACK)
                 setTypeface(Typeface.DEFAULT_BOLD)
-                setPadding(0, 48, 0, if (hint == null) 16 else 6)
+                setPadding(0, dp(28), 0, if (hint == null) dp(8) else dp(4))
             })
             if (hint != null) {
                 root.addView(TextView(this).apply {
                     this.text = hint
                     textSize = 14f
                     setTextColor(Color.DKGRAY)
-                    setPadding(0, 0, 0, 24)
+                    setPadding(0, 0, 0, dp(12))
                 })
             }
-            root.addView(createDivider(4, 0, 32))
+            root.addView(createDivider(dp(2), 0, dp(18)))
         }
 
         fun addHint(hint: String): TextView {
@@ -595,7 +632,7 @@ class MainActivity : ComponentActivity() {
                 text = hint
                 textSize = 13f
                 setTextColor(Color.DKGRAY)
-                setPadding(0, 0, 0, 16)
+                setPadding(0, 0, 0, dp(10))
                 root.addView(this)
             }
         }
@@ -637,7 +674,11 @@ class MainActivity : ComponentActivity() {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, 16, 0, 32)
+                minimumHeight = dp(64)
+                setPadding(0, dp(6), 0, dp(10))
+                isClickable = true
+                isFocusable = true
+                contentDescription = label
             }
             row.addView(TextView(this).apply {
                 text = label
@@ -646,9 +687,9 @@ class MainActivity : ComponentActivity() {
                 layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
             })
             val box = LinearLayout(this).apply {
-                layoutParams = LinearLayout.LayoutParams(64, 64)
-                setPadding(12, 12, 12, 12)
-                background = inkBorder(4)
+                layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
+                setPadding(dp(10), dp(10), dp(10), dp(10))
+                background = inkBorder()
             }
             val inner = View(this).apply {
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
@@ -685,25 +726,31 @@ class MainActivity : ComponentActivity() {
             fun render() {
                 allViews.forEach { (id, tv) ->
                     val selected = group.checkedRadioButtonId == id
-                    tv.setBackgroundColor(if (selected) Color.BLACK else Color.TRANSPARENT)
-                    tv.setTextColor(if (selected) Color.WHITE else Color.BLACK)
+                    val original = tv.tag as String
+                    tv.text = "${if (selected) "●" else "○"} $original"
+                    tv.setBackgroundColor(Color.WHITE)
+                    tv.setTextColor(Color.BLACK)
+                    tv.setTypeface(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
+                    tv.contentDescription = "$original，${if (selected) "已选择" else "未选择"}"
                 }
             }
             if (isVertical) {
                 val segmented = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
-                    background = inkBorder(4)
+                    background = inkBorder()
                     layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                        setMargins(0, 0, 0, 32)
+                        setMargins(0, 0, 0, dp(18))
                     }
                 }
                 options.forEachIndexed { index, (id, text) ->
                     val tv = TextView(this).apply {
                         this.text = text
+                        tag = text
                         textSize = if (text.contains("\n")) 16f else 18f
-                        setTypeface(Typeface.DEFAULT_BOLD)
-                        setLineSpacing(4f, 1.0f)
-                        setPadding(32, 24, 32, 24)
+                        minimumHeight = dp(60)
+                        gravity = Gravity.CENTER_VERTICAL
+                        setLineSpacing(dp(2).toFloat(), 1.0f)
+                        setPadding(dp(18), dp(12), dp(18), dp(12))
                         setOnClickListener {
                             group.check(id)
                             render()
@@ -714,7 +761,7 @@ class MainActivity : ComponentActivity() {
                     if (index < options.size - 1) {
                         segmented.addView(View(this).apply {
                             setBackgroundColor(Color.BLACK)
-                            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 4)
+                            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2))
                         })
                     }
                 }
@@ -722,9 +769,9 @@ class MainActivity : ComponentActivity() {
             } else {
                 val segmented = LinearLayout(this).apply {
                     orientation = LinearLayout.VERTICAL
-                    background = inkBorder(4)
+                    background = inkBorder()
                     layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                        setMargins(0, 0, 0, 32)
+                        setMargins(0, 0, 0, dp(18))
                     }
                 }
                 options.chunked(3).forEachIndexed { rowIndex, rowOptions ->
@@ -735,12 +782,13 @@ class MainActivity : ComponentActivity() {
                     rowOptions.forEachIndexed { colIndex, (id, text) ->
                         val tv = TextView(this).apply {
                             this.text = text
+                            tag = text
                             textSize = if (text.contains("\n")) 13f else 16f
-                            setTypeface(Typeface.DEFAULT_BOLD)
                             gravity = Gravity.CENTER
-                            setLineSpacing(4f, 1.0f)
-                            setPadding(12, 20, 12, 20)
-                            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                            minimumHeight = dp(60)
+                            setLineSpacing(dp(2).toFloat(), 1.0f)
+                            setPadding(dp(6), dp(10), dp(6), dp(10))
+                            layoutParams = LinearLayout.LayoutParams(0, dp(60), 1f)
                             setOnClickListener {
                                 group.check(id)
                                 render()
@@ -751,14 +799,14 @@ class MainActivity : ComponentActivity() {
                         if (colIndex < rowOptions.size - 1) {
                             row.addView(View(this).apply {
                                 setBackgroundColor(Color.BLACK)
-                                layoutParams = LinearLayout.LayoutParams(4, ViewGroup.LayoutParams.MATCH_PARENT)
+                                layoutParams = LinearLayout.LayoutParams(dp(2), ViewGroup.LayoutParams.MATCH_PARENT)
                             })
                         }
                     }
                     while (rowOptions.size < 3 && row.childCount < 5) {
                         row.addView(View(this).apply {
                             setBackgroundColor(Color.BLACK)
-                            layoutParams = LinearLayout.LayoutParams(4, ViewGroup.LayoutParams.MATCH_PARENT)
+                            layoutParams = LinearLayout.LayoutParams(dp(2), ViewGroup.LayoutParams.MATCH_PARENT)
                         })
                         row.addView(View(this).apply {
                             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -768,7 +816,7 @@ class MainActivity : ComponentActivity() {
                     if (rowIndex < options.chunked(3).size - 1) {
                         segmented.addView(View(this).apply {
                             setBackgroundColor(Color.BLACK)
-                            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 4)
+                            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2))
                         })
                     }
                 }
@@ -779,65 +827,154 @@ class MainActivity : ComponentActivity() {
             return wrap
         }
 
-        fun bindSlider(label: String, target: EditText, min: Int, max: Int): LinearLayout {
+        fun bindNumberControl(
+            label: String,
+            target: EditText,
+            min: Int,
+            max: Int,
+            step: Int = 1,
+            presets: List<Int> = emptyList()
+        ): LinearLayout {
             val wrap = LinearLayout(this).apply {
                 orientation = LinearLayout.VERTICAL
-                setPadding(0, 16, 0, 32)
+                setPadding(0, dp(8), 0, dp(18))
             }
-            val headerRow = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            headerRow.addView(TextView(this).apply {
+            wrap.addView(TextView(this).apply {
                 text = label
                 textSize = 20f
                 setTextColor(Color.BLACK)
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                setPadding(0, 0, 0, dp(8))
             })
+
+            val controlRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                minimumHeight = dp(64)
+                background = inkBorder()
+            }
             val valueText = TextView(this).apply {
                 textSize = 24f
                 setTypeface(Typeface.DEFAULT_BOLD)
                 setTextColor(Color.BLACK)
+                gravity = Gravity.CENTER
+                minimumHeight = dp(64)
+                layoutParams = LinearLayout.LayoutParams(0, dp(64), 1f)
+                isClickable = true
+                isFocusable = true
+                contentDescription = "$label，点击精确输入"
             }
-            var bar: SeekBar? = null
-            fun setValue(v: Int, fromSeek: Boolean = false) {
+
+            val presetViews = mutableListOf<Pair<Int, TextView>>()
+            fun currentValue(): Int {
+                return target.text.toString().trim().toIntOrNull()?.coerceIn(min, max) ?: min
+            }
+            fun renderValue(v: Int) {
                 val next = v.coerceIn(min, max)
                 valueText.text = next.toString()
+                valueText.contentDescription = "$label，当前值 $next，点击精确输入"
+                presetViews.forEach { (preset, view) ->
+                    val selected = preset == next
+                    view.text = "${if (selected) "●" else "○"} $preset"
+                    view.setTypeface(Typeface.DEFAULT, if (selected) Typeface.BOLD else Typeface.NORMAL)
+                    view.contentDescription = "$label $preset，${if (selected) "当前值" else "点击选择"}"
+                }
+            }
+            fun setValue(v: Int) {
+                val next = v.coerceIn(min, max)
+                renderValue(next)
                 if (target.text.toString() != next.toString()) {
                     target.setText(next.toString())
                     target.setSelection(target.text.length)
                 }
-                if (!fromSeek) bar?.progress = next - min
             }
-            headerRow.addView(valueText)
-            wrap.addView(headerRow)
-            val initial = target.text.toString().trim().toIntOrNull()?.coerceIn(min, max) ?: min
-            bar = SeekBar(this).apply {
-                this.max = max - min
-                progress = initial - min
-                setPadding(0, 32, 0, 32)
-                progressDrawable?.setTint(Color.BLACK)
-                thumb?.setTint(Color.BLACK)
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                        if (fromUser) setValue(progress + min, fromSeek = true)
-                        else valueText.text = (progress + min).toString()
+            fun makeStepButton(symbol: String, delta: Int): TextView {
+                return TextView(this).apply {
+                    text = symbol
+                    textSize = 32f
+                    setTypeface(Typeface.DEFAULT_BOLD)
+                    setTextColor(Color.BLACK)
+                    gravity = Gravity.CENTER
+                    minimumHeight = dp(64)
+                    layoutParams = LinearLayout.LayoutParams(dp(72), dp(64))
+                    isClickable = true
+                    isFocusable = true
+                    contentDescription = if (delta < 0) "$label 减少 $step" else "$label 增加 $step"
+                    setOnClickListener { setValue(currentValue() + delta) }
+                }
+            }
+
+            controlRow.addView(makeStepButton("−", -step))
+            controlRow.addView(View(this).apply {
+                setBackgroundColor(Color.BLACK)
+                layoutParams = LinearLayout.LayoutParams(dp(2), ViewGroup.LayoutParams.MATCH_PARENT)
+            })
+            controlRow.addView(valueText)
+            controlRow.addView(View(this).apply {
+                setBackgroundColor(Color.BLACK)
+                layoutParams = LinearLayout.LayoutParams(dp(2), ViewGroup.LayoutParams.MATCH_PARENT)
+            })
+            controlRow.addView(makeStepButton("+", step))
+            wrap.addView(controlRow)
+
+            valueText.setOnClickListener {
+                val edit = EditText(this).apply {
+                    setText(currentValue().toString())
+                    selectAll()
+                    textSize = 22f
+                    inputType = InputType.TYPE_CLASS_NUMBER
+                    minimumHeight = dp(64)
+                    setPadding(dp(16), dp(8), dp(16), dp(8))
+                }
+                AlertDialog.Builder(this)
+                    .setTitle("$label ($min-$max)")
+                    .setView(edit)
+                    .setNegativeButton("取消", null)
+                    .setPositiveButton("确定") { _, _ ->
+                        setValue(edit.text.toString().trim().toIntOrNull() ?: currentValue())
                     }
-                    override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-                    override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-                })
+                    .show()
             }
-            setValue(initial)
+
+            val validPresets = presets.distinct().filter { it in min..max }
+            validPresets.chunked(3).forEach { rowPresets ->
+                val presetRow = LinearLayout(this).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    setPadding(0, dp(8), 0, 0)
+                }
+                rowPresets.forEach { preset ->
+                    val presetView = TextView(this).apply {
+                        textSize = 17f
+                        setTextColor(Color.BLACK)
+                        gravity = Gravity.CENTER
+                        minimumHeight = dp(52)
+                        background = inkBorder(dp(1))
+                        layoutParams = LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+                            setMargins(dp(3), 0, dp(3), 0)
+                        }
+                        setOnClickListener { setValue(preset) }
+                    }
+                    presetViews.add(preset to presetView)
+                    presetRow.addView(presetView)
+                }
+                repeat(3 - rowPresets.size) {
+                    presetRow.addView(View(this).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, dp(52), 1f).apply {
+                            setMargins(dp(3), 0, dp(3), 0)
+                        }
+                    })
+                }
+                wrap.addView(presetRow)
+            }
+
+            renderValue(currentValue())
             target.addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
                     val v = s?.toString()?.trim()?.toIntOrNull()?.coerceIn(min, max) ?: min
-                    valueText.text = v.toString()
-                    if (bar?.progress != v - min) bar?.progress = v - min
+                    renderValue(v)
                 }
                 override fun afterTextChanged(s: Editable?) {}
             })
-            bar?.let { wrap.addView(it) }
             root.addView(wrap)
             return wrap
         }
@@ -847,6 +984,8 @@ class MainActivity : ComponentActivity() {
                 setText(target.text.toString())
                 setSelection(text.length)
                 textSize = 20f
+                minimumHeight = dp(64)
+                setPadding(dp(16), dp(8), dp(16), dp(8))
                 if (numericOnly) inputType = InputType.TYPE_CLASS_NUMBER
             }
             AlertDialog.Builder(this)
@@ -866,11 +1005,15 @@ class MainActivity : ComponentActivity() {
             val box = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
-                setPadding(32, 40, 32, 40)
+                minimumHeight = dp(64)
+                setPadding(dp(16), dp(12), dp(16), dp(12))
                 layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
-                    setMargins(0, 16, 0, 32)
+                    setMargins(0, dp(8), 0, dp(18))
                 }
-                background = inkBorder(4)
+                background = inkBorder()
+                isClickable = onClick != null
+                isFocusable = onClick != null
+                contentDescription = label
                 setOnClickListener { onClick?.invoke() }
             }
             box.addView(TextView(this).apply {
@@ -1169,20 +1312,53 @@ class MainActivity : ComponentActivity() {
         val includeUnreadRow = bindToggle("最近阅读包含未读（readingStatus=0）", includeUnreadCheck)
         addHint("说明：关闭后会尽量排除只进过书库但没真正开始读的书。")
         val readingFilterSegment = bindSegmented("书单筛选（状态）", readingFilterGroup, readingFilterOptions, isVertical = false)
-        val topNSlider = bindSlider("Top N（最多显示书籍数量）", topNInput, 1, 5)
+        bindNumberControl(
+            "Top N（最多显示书籍数量）",
+            topNInput,
+            1,
+            5,
+            presets = listOf(1, 2, 3, 4, 5)
+        )
         addHint("说明：默认最多5本；如果底部还要显示图表和条码，3本会更宽松。")
-        val minDurationSlider = bindSlider("最小时长阈值（分钟，作用于“按阅读时长事件”）", minDurationInput, 0, 240)
+        bindNumberControl(
+            "最小时长阈值（分钟，作用于“按阅读时长事件”）",
+            minDurationInput,
+            0,
+            240,
+            presets = listOf(0, 1, 3, 5, 10)
+        )
         addHint("说明：小于这个时长的阅读事件会被忽略，可过滤误打开。")
 
         addSectionTitle("排版与字体", "标题、字号、进度与字体")
         val titleRow = bindEditRow("账单标题", titleInput)
         addHint("说明：会显示在壁纸右上角，例如“阅读账单”或“留台单”。")
-        val titleSizeSlider = bindSlider("标题字号", titleSizeInput, 24, 120)
-        val bodySizeSlider = bindSlider("正文字号基准", bodySizeInput, 18, 60)
+        bindNumberControl(
+            "标题字号",
+            titleSizeInput,
+            24,
+            120,
+            step = 2,
+            presets = listOf(48, 64, 74, 96)
+        )
+        bindNumberControl(
+            "正文字号基准",
+            bodySizeInput,
+            18,
+            60,
+            step = 2,
+            presets = listOf(24, 30, 34, 42)
+        )
         addHint("说明：字号会影响整张壁纸能放下多少内容；书多时建议调小。")
         val serialSegment = bindSegmented("单号数字模式", serialModeGroup, serialOptions, isVertical = false)
         val serialCustomRow = bindEditRow("自定义数字", serialCustomInput, numericOnly = true, maxDigits = 12)
-        val serialSizeSlider = bindSlider("单号数字字号", serialNumberSizeInput, 24, 140)
+        bindNumberControl(
+            "单号数字字号",
+            serialNumberSizeInput,
+            24,
+            140,
+            step = 2,
+            presets = listOf(36, 46, 60, 80)
+        )
         addHint("说明：数字变大时会向上扩展，避免挤压下面的操作编号。")
         val progressStatusRow = bindToggle("显示进度和状态行", showProgressStatusCheck)
         addHint("说明：关闭后书单更简洁，但看不到读到哪里。")
@@ -1217,7 +1393,14 @@ class MainActivity : ComponentActivity() {
         val chartRuleHint = addHint("图表横轴规则：当天/昨天=按小时；本周/上周/最近7天=按天；最近30天=按天；自定义<=14天按天，15-90天按周，>90天按月。")
         val peakLabelRow = bindToggle("显示峰值标签", showPeakLabelCheck)
         val yAxisSegment = bindSegmented("Y轴最大值", yAxisModeGroup, yAxisOptions, isVertical = false)
-        val yAxisFixedSlider = bindSlider("Y轴固定最大值(分钟)", yAxisMaxInput, 1, 2000)
+        val yAxisFixedControl = bindNumberControl(
+            "Y轴固定最大值(分钟)",
+            yAxisMaxInput,
+            1,
+            2000,
+            step = 10,
+            presets = listOf(60, 120, 300, 600)
+        )
         addHint("说明：固定值越大，柱子/曲线越矮；用于不同周期之间保持同一比例。")
 
         addSectionTitle("底部备注与条码", "备注文本与装饰条码参数")
@@ -1238,7 +1421,13 @@ class MainActivity : ComponentActivity() {
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { autoDailyValue.text = normalizeDailyTime(autoDailyTimeInput.text.toString()) }
             override fun afterTextChanged(s: Editable?) {}
         })
-        val autoMinIntervalSlider = bindSlider("熄屏触发最小间隔(分钟)", autoMinIntervalInput, 1, 240)
+        val autoMinIntervalControl = bindNumberControl(
+            "熄屏触发最小间隔(分钟)",
+            autoMinIntervalInput,
+            1,
+            240,
+            presets = listOf(1, 3, 5, 10, 30, 60)
+        )
         addHint("说明：间隔越短越及时，也越容易增加耗电；3分钟是折中值。")
         autoModeHintText = TextView(this).apply {
             textSize = 13f
@@ -1250,6 +1439,12 @@ class MainActivity : ComponentActivity() {
             textSize = 13f
             setTextColor(Color.DKGRAY)
             setPadding(0, 0, 0, 16)
+            root.addView(this)
+        }
+        autoExactAlarmButton = Button(this).apply {
+            text = "允许精确定时"
+            isAllCaps = false
+            setOnClickListener { openExactAlarmSettings() }
             root.addView(this)
         }
         val autoWarningText = addHint("提示：熄屏触发会增加唤醒次数与耗电；NeoReader 常在退出当前书籍/会话落库后才更新元数据，所以可能出现“本次锁屏仍是旧封面、下次锁屏生效”的现象。")
@@ -1387,7 +1582,7 @@ class MainActivity : ComponentActivity() {
             chartRuleHint.visibility = if (showChart) View.VISIBLE else View.GONE
             peakLabelRow.visibility = if (showChart) View.VISIBLE else View.GONE
             yAxisSegment.visibility = if (showChart) View.VISIBLE else View.GONE
-            yAxisFixedSlider.visibility = if (showChart && yAxisModeGroup.checkedRadioButtonId == 7102) View.VISIBLE else View.GONE
+            yAxisFixedControl.visibility = if (showChart && yAxisModeGroup.checkedRadioButtonId == 7102) View.VISIBLE else View.GONE
 
             val footerMode = footerModeGroup.checkedRadioButtonId
             noteRow.visibility = if (footerMode != 3001) View.VISIBLE else View.GONE
@@ -1397,9 +1592,14 @@ class MainActivity : ComponentActivity() {
             val autoEnabled = autoRefreshCheck.isChecked
             autoModeSegment.visibility = if (autoEnabled) View.VISIBLE else View.GONE
             autoDailyRow.visibility = if (autoEnabled && autoModeGroup.checkedRadioButtonId == 8001) View.VISIBLE else View.GONE
-            autoMinIntervalSlider.visibility = if (autoEnabled && autoModeGroup.checkedRadioButtonId == 8002) View.VISIBLE else View.GONE
+            autoMinIntervalControl.visibility = if (autoEnabled && autoModeGroup.checkedRadioButtonId == 8002) View.VISIBLE else View.GONE
             autoModeHintText.visibility = if (autoEnabled) View.VISIBLE else View.GONE
             autoStateText.visibility = if (autoEnabled) View.VISIBLE else View.GONE
+            autoExactAlarmButton.visibility = if (
+                autoEnabled &&
+                autoModeGroup.checkedRadioButtonId == 8001 &&
+                !AutoRefreshScheduler.canScheduleExact(this)
+            ) View.VISIBLE else View.GONE
             autoWarningText.visibility = if (autoEnabled) View.VISIBLE else View.GONE
         }
 
@@ -1581,26 +1781,62 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    private fun beginPreviewRequest(): Int {
+        previewDebounceRunnable?.let(uiHandler::removeCallbacks)
+        previewDebounceRunnable = null
+        previewRequestId += 1
+        return previewRequestId
+    }
+
     private fun applySettingsPreview() {
+        if (isInitializingUi || isApplyingSettings || isDestroyed) return
         val settings = readSettingsFromUi()
         saveSettings(settings)
         saveAndApplyAutoRefreshSettings()
+        val requestId = beginPreviewRequest()
+        previewPresetText = wallpaperSizeDisplayText(settings)
+
         if (settings.sourceMode == DataSourceMode.WEREAD || settings.sourceMode == DataSourceMode.MIXED) {
-            previewPresetText = wallpaperSizeDisplayText(settings)
             val label = if (settings.sourceMode == DataSourceMode.MIXED) "混合来源" else "微信读书来源"
-            statusText.text = "$label 已保存\n请点击“刷新预览”或“生成壁纸”获取最新内容。"
-            changeStateText.text = "状态: $label 参数已变更（未联网）｜尺寸: $previewPresetText"
+            statusText.text = "$label 参数已保存\n点击“刷新预览”或“生成壁纸”时才会联网。"
+            changeStateText.text = "状态: $label 参数已保存（未联网）｜尺寸: $previewPresetText"
             refreshPreview()
-            writeDebugLog(if (settings.sourceMode == DataSourceMode.MIXED) "mixed_source_settings_saved" else "weread_source_settings_saved")
             return
         }
-        val (bmp, result) = renderWallpaperPreview(settings)
-        previewBitmap = bmp
-        previewPresetText = wallpaperSizeDisplayText(settings)
-        statusText.text = "预览已更新（未写入文件）\n$result"
-        changeStateText.text = "状态: 参数已变更（仅预览）｜尺寸: $previewPresetText"
-        refreshPreview()
-        writeDebugLog("preview_updated")
+
+        statusText.text = "参数已保存\n停止操作后将自动更新预览。"
+        changeStateText.text = "状态: 等待更新预览｜尺寸: $previewPresetText"
+        val task = Runnable {
+            previewDebounceRunnable = null
+            if (requestId == previewRequestId && !isDestroyed) {
+                renderLocalPreviewAsync(settings, requestId, showPreviewAfter = false)
+            }
+        }
+        previewDebounceRunnable = task
+        uiHandler.postDelayed(task, PREVIEW_DEBOUNCE_MS)
+    }
+
+    private fun renderLocalPreviewAsync(settings: Settings, requestId: Int, showPreviewAfter: Boolean) {
+        if (requestId != previewRequestId || isDestroyed) return
+        changeStateText.text = "状态: 正在后台生成预览｜尺寸: ${wallpaperSizeDisplayText(settings)}"
+        previewExecutor.execute {
+            val rendered = runCatching { renderWallpaperPreview(settings) }
+            uiHandler.post {
+                if (requestId != previewRequestId || isDestroyed || isFinishing) return@post
+                rendered.onSuccess { (bmp, result) ->
+                    previewBitmap = bmp
+                    previewPresetText = wallpaperSizeDisplayText(settings)
+                    statusText.text = "预览已更新（未写入文件）\n$result"
+                    changeStateText.text = "状态: 预览已更新｜尺寸: $previewPresetText"
+                    refreshPreview()
+                    if (showPreviewAfter) showPreviewPage()
+                }.onFailure { error ->
+                    statusText.text = "预览生成失败\n${error.javaClass.simpleName}: ${error.message ?: "未知错误"}"
+                    changeStateText.text = "状态: 预览生成失败"
+                    AutoRefreshLog.e(this, "preview generation failed", error)
+                }
+            }
+        }
     }
 
     private fun openWeekStartDatePicker() {
@@ -1666,16 +1902,34 @@ class MainActivity : ComponentActivity() {
         }
         saveSettings(settings)
         saveAndApplyAutoRefreshSettings()
-        val (bmp, result) = renderWallpaperPreview(settings)
-        previewBitmap = bmp
+        val requestId = beginPreviewRequest()
         previewPresetText = wallpaperSizeDisplayText(settings)
-        val saved = saveBitmapToPictures(bmp)
-        lastSavedPath = saved
-        statusText.text = "已生成并覆盖文件\n$result\n路径: $saved"
-        changeStateText.text = "状态: 已生成并保存｜尺寸: $previewPresetText"
-        refreshPreview()
-        showPreviewPage()
-        writeDebugLog("generated_saved")
+        statusText.text = "正在后台生成并保存壁纸..."
+        changeStateText.text = "状态: 正在生成壁纸｜尺寸: $previewPresetText"
+        previewExecutor.execute {
+            val generated = runCatching {
+                val (bmp, result) = renderWallpaperPreview(settings)
+                val saved = if (requestId == previewRequestId) saveBitmapToPictures(bmp) else null
+                Triple(bmp, result, saved)
+            }
+            uiHandler.post {
+                if (requestId != previewRequestId || isDestroyed || isFinishing) return@post
+                generated.onSuccess { (bmp, result, saved) ->
+                    if (saved == null) return@onSuccess
+                    previewBitmap = bmp
+                    lastSavedPath = saved
+                    statusText.text = "已生成并覆盖文件\n$result\n路径: $saved"
+                    changeStateText.text = "状态: 已生成并保存｜尺寸: $previewPresetText"
+                    refreshPreview()
+                    showPreviewPage()
+                    collectMetadataDebugSampleAsync("generated_saved")
+                }.onFailure { error ->
+                    statusText.text = "壁纸生成或保存失败\n${error.javaClass.simpleName}: ${error.message ?: "未知错误"}"
+                    changeStateText.text = "状态: 壁纸生成失败"
+                    AutoRefreshLog.e(this, "wallpaper generation failed", error)
+                }
+            }
+        }
     }
 
     private fun saveAndApplyAutoRefreshSettings() {
@@ -1684,21 +1938,35 @@ class MainActivity : ComponentActivity() {
         val dailyTime = normalizeDailyTime(autoDailyTimeInput.text.toString())
         val minInterval = autoMinIntervalInput.text.toString().trim().toIntOrNull()?.coerceIn(1, 240) ?: 3
         val prefs = getSharedPreferences(AutoRefreshConfig.PREFS_NAME, Context.MODE_PRIVATE)
-        prefs.edit()
-            .putBoolean(AutoRefreshConfig.KEY_AUTO_ENABLED, isEnabled)
-            .putString(AutoRefreshConfig.KEY_AUTO_MODE, mode)
-            .putString(AutoRefreshConfig.KEY_DAILY_TIME, dailyTime)
-            .putInt(AutoRefreshConfig.KEY_SCREEN_OFF_MIN_INTERVAL, minInterval)
-            .apply()
+        val changed = prefs.getBoolean(AutoRefreshConfig.KEY_AUTO_ENABLED, true) != isEnabled ||
+            prefs.getString(AutoRefreshConfig.KEY_AUTO_MODE, AutoRefreshConfig.MODE_DAILY) != mode ||
+            prefs.getString(AutoRefreshConfig.KEY_DAILY_TIME, "22:30") != dailyTime ||
+            prefs.getInt(AutoRefreshConfig.KEY_SCREEN_OFF_MIN_INTERVAL, 3) != minInterval
+        if (changed) {
+            prefs.edit()
+                .putBoolean(AutoRefreshConfig.KEY_AUTO_ENABLED, isEnabled)
+                .putString(AutoRefreshConfig.KEY_AUTO_MODE, mode)
+                .putString(AutoRefreshConfig.KEY_DAILY_TIME, dailyTime)
+                .putInt(AutoRefreshConfig.KEY_SCREEN_OFF_MIN_INTERVAL, minInterval)
+                .apply()
+        }
         if (autoDailyTimeInput.text.toString() != dailyTime) {
-            autoDailyTimeInput.setText(dailyTime)
-            autoDailyTimeInput.setSelection(dailyTime.length)
+            isApplyingSettings = true
+            try {
+                autoDailyTimeInput.setText(dailyTime)
+                autoDailyTimeInput.setSelection(dailyTime.length)
+            } finally {
+                isApplyingSettings = false
+            }
         }
         updateAutoRefreshHint()
-        updateAutoRuntimeState()
-        AutoRefreshScheduler.reschedule(this)
-        AutoRefreshRuntime.sync(this)
-        AutoRefreshLog.i(this, "auto settings updated: enabled=$isEnabled mode=$mode dailyTime=$dailyTime minInterval=$minInterval")
+        if (changed || !autoRuntimeInitialized) {
+            updateAutoRuntimeState()
+            AutoRefreshScheduler.reschedule(this)
+            AutoRefreshRuntime.sync(this)
+            autoRuntimeInitialized = true
+            AutoRefreshLog.i(this, "auto settings updated: enabled=$isEnabled mode=$mode dailyTime=$dailyTime minInterval=$minInterval changed=$changed")
+        }
     }
 
     private fun updateAutoRefreshHint() {
@@ -1724,6 +1992,7 @@ class MainActivity : ComponentActivity() {
             "screen_on_prewarm" -> "亮屏预热"
             "user_present_prewarm" -> "解锁预热"
             "book_content_changed" -> "内容变化"
+            "reading_stats_changed" -> "阅读统计变化"
             "daily_alarm" -> "每日定时"
             "" -> "暂无"
             else -> lastReasonRaw
@@ -1733,14 +2002,36 @@ class MainActivity : ComponentActivity() {
         } else {
             "暂无"
         }
+        val exactAllowed = AutoRefreshScheduler.canScheduleExact(this)
         val runtimeHint = if (!enabled) {
             "自动已关闭"
         } else if (mode == AutoRefreshConfig.MODE_SCREEN_OFF) {
             "熄屏监听应运行（前台服务）"
+        } else if (exactAllowed) {
+            "按每日精确定时运行（$dailyTime）"
         } else {
-            "按每日定时运行（$dailyTime）"
+            "按每日非精确定时运行（$dailyTime，系统可能延后）"
+        }
+        if (::autoExactAlarmButton.isInitialized) {
+            autoExactAlarmButton.visibility = if (
+                enabled && mode == AutoRefreshConfig.MODE_DAILY && !exactAllowed
+            ) View.VISIBLE else View.GONE
         }
         autoStateText.text = "自动状态：$runtimeHint\n最近触发：$lastTime（$lastReason）\n当前参数：模式=$mode，定时=$dailyTime，熄屏间隔=${minInterval}分钟"
+    }
+
+    private fun openExactAlarmSettings() {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.S) return
+        val packageUri = Uri.parse("package:$packageName")
+        runCatching {
+            startActivity(
+                Intent(android.provider.Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, packageUri)
+            )
+        }.onFailure {
+            startActivity(
+                Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
+            )
+        }
     }
 
     private fun updateReleaseStatusFromCache() {
@@ -1893,6 +2184,8 @@ class MainActivity : ComponentActivity() {
         saveWeReadApiKeyFromUi()
         val settings = readSettingsFromUi()
         saveSettings(settings)
+        saveAndApplyAutoRefreshSettings()
+        val requestId = beginPreviewRequest()
         val periodLabel = weReadPeriodLabel(settings.periodMode)
         val sourceLabel = if (settings.sourceMode == DataSourceMode.MIXED) "混合来源" else "微信读书"
         isTestingWeRead = true
@@ -1900,13 +2193,15 @@ class MainActivity : ComponentActivity() {
         if (::wereadStatusText.isInitialized) {
             wereadStatusText.text = "$sourceLabel：正在生成${periodLabel}预览..."
         }
-        Thread {
-            val preview = buildSourcePreviewForWallpaperMode(settings)
-            runOnUiThread {
+        previewExecutor.execute {
+            val rendered = runCatching { buildSourcePreviewForWallpaperMode(settings) }
+            uiHandler.post {
                 isTestingWeRead = false
+                if (requestId != previewRequestId || isDestroyed || isFinishing) return@post
+                val preview = rendered.getOrNull()
                 if (preview != null) {
                     previewBitmap = preview.bitmap
-                    previewPresetText = wallpaperSizeDisplayText(readSettingsFromUi())
+                    previewPresetText = wallpaperSizeDisplayText(settings)
                     statusText.text = "${sourceLabel}预览已更新（未写入文件）\n${preview.summary}"
                     changeStateText.text = "状态: ${sourceLabel}预览已更新｜尺寸: $previewPresetText"
                     lastWeReadWallpaperDebug = "ok=true, period=$periodLabel, summary=${preview.summary}"
@@ -1914,15 +2209,15 @@ class MainActivity : ComponentActivity() {
                     showPreviewPage()
                 } else {
                     changeStateText.text = "状态: ${sourceLabel}预览失败"
-                    lastWeReadWallpaperDebug = "ok=false, period=$periodLabel"
+                    lastWeReadWallpaperDebug = "ok=false, period=$periodLabel, error=${rendered.exceptionOrNull()?.message ?: "empty preview"}"
                 }
                 if (::wereadStatusText.isInitialized) {
                     wereadStatusText.text = "${wereadStatusText.text}\n账单预览：${lastWeReadWallpaperDebug.take(180)}"
                 }
                 appendUiDebug("weread wallpaper $lastWeReadWallpaperDebug")
-                writeDebugLog("weread_wallpaper_preview")
+                collectMetadataDebugSampleAsync("weread_wallpaper_preview")
             }
-        }.start()
+        }
     }
 
     private fun generateWeReadWallpaper() {
@@ -1930,6 +2225,8 @@ class MainActivity : ComponentActivity() {
         saveWeReadApiKeyFromUi()
         val settings = readSettingsFromUi()
         saveSettings(settings)
+        saveAndApplyAutoRefreshSettings()
+        val requestId = beginPreviewRequest()
         val periodLabel = weReadPeriodLabel(settings.periodMode)
         val sourceLabel = if (settings.sourceMode == DataSourceMode.MIXED) "混合来源" else "微信读书"
         isTestingWeRead = true
@@ -1937,15 +2234,24 @@ class MainActivity : ComponentActivity() {
         if (::wereadStatusText.isInitialized) {
             wereadStatusText.text = "$sourceLabel：正在生成并保存${periodLabel}壁纸..."
         }
-        Thread {
-            val preview = buildSourcePreviewForWallpaperMode(settings)
-            runOnUiThread {
+        previewExecutor.execute {
+            val generated = runCatching {
+                val preview = buildSourcePreviewForWallpaperMode(settings)
+                val saved = if (preview != null && requestId == previewRequestId) {
+                    saveBitmapToPictures(preview.bitmap)
+                } else {
+                    null
+                }
+                preview to saved
+            }
+            uiHandler.post {
                 isTestingWeRead = false
-                if (preview != null) {
-                    val saved = saveBitmapToPictures(preview.bitmap)
+                if (requestId != previewRequestId || isDestroyed || isFinishing) return@post
+                val (preview, saved) = generated.getOrNull() ?: (null to null)
+                if (preview != null && saved != null) {
                     previewBitmap = preview.bitmap
                     lastSavedPath = saved
-                    previewPresetText = wallpaperSizeDisplayText(readSettingsFromUi())
+                    previewPresetText = wallpaperSizeDisplayText(settings)
                     statusText.text = "${sourceLabel}壁纸已生成并覆盖文件\n${preview.summary}\n路径: $saved"
                     changeStateText.text = "状态: ${sourceLabel}壁纸已生成并保存｜尺寸: $previewPresetText"
                     lastWeReadWallpaperDebug = "ok=true, period=$periodLabel, saved=$saved, summary=${preview.summary}"
@@ -1953,15 +2259,15 @@ class MainActivity : ComponentActivity() {
                     showPreviewPage()
                 } else {
                     changeStateText.text = "状态: ${sourceLabel}生成失败"
-                    lastWeReadWallpaperDebug = "ok=false, period=$periodLabel, saved=<none>"
+                    lastWeReadWallpaperDebug = "ok=false, period=$periodLabel, saved=<none>, error=${generated.exceptionOrNull()?.message ?: "empty preview"}"
                 }
                 if (::wereadStatusText.isInitialized) {
                     wereadStatusText.text = "${wereadStatusText.text}\n账单生成：${lastWeReadWallpaperDebug.take(180)}"
                 }
                 appendUiDebug("weread wallpaper generated $lastWeReadWallpaperDebug")
-                writeDebugLog("weread_wallpaper_generated")
+                collectMetadataDebugSampleAsync("weread_wallpaper_generated")
             }
-        }.start()
+        }
     }
 
     private fun buildWeReadPreviewForWallpaperMode(wallpaperMode: String): AutoWallpaperGenerator.PreviewResult? {
@@ -2178,14 +2484,24 @@ class MainActivity : ComponentActivity() {
         val settings = readSettingsFromUi()
         if (settings.sourceMode == DataSourceMode.WEREAD || settings.sourceMode == DataSourceMode.MIXED) {
             previewWeReadWallpaper()
-            collectMetadataDebugSample()
-            showPreviewPage()
             return
         }
-        applySettingsPreview()
-        collectMetadataDebugSample()
-        writeDebugLog("manual_refresh_preview")
+        saveSettings(settings)
+        saveAndApplyAutoRefreshSettings()
+        val requestId = beginPreviewRequest()
+        statusText.text = "正在后台刷新预览..."
+        renderLocalPreviewAsync(settings, requestId, showPreviewAfter = true)
+        collectMetadataDebugSampleAsync("manual_refresh_preview")
         showPreviewPage()
+    }
+
+    private fun collectMetadataDebugSampleAsync(logEvent: String) {
+        debugExecutor.execute {
+            collectMetadataDebugSample()
+            uiHandler.post {
+                if (!isDestroyed && !isFinishing) writeDebugLog(logEvent)
+            }
+        }
     }
 
     private fun collectMetadataDebugSample() {
@@ -2243,10 +2559,9 @@ class MainActivity : ComponentActivity() {
             val start = startOfDayMs(now - 29L * 24L * 60L * 60L * 1000L)
             val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
             val metaByPath = linkedMapOf<String, CalendarMetaBook>()
-            val metaByName = linkedMapOf<String, CalendarMetaBook>()
             contentResolver.query(
                 metadataUri,
-                arrayOf("nativeAbsolutePath", "title", "authors", "lastAccess", "coverUrl", "extraInfo", "downloadInfo"),
+                arrayOf("nativeAbsolutePath", "title", "authors", "coverUrl", "extraInfo", "downloadInfo"),
                 null,
                 null,
                 null
@@ -2261,11 +2576,9 @@ class MainActivity : ComponentActivity() {
                     if (path.isBlank()) continue
                     val title = col("title").ifBlank { File(path).nameWithoutExtension }
                     val author = col("authors")
-                    val lastAccess = normalizeEpochMs(col("lastAccess").toLongOrNull() ?: 0L)
                     val coverHint = listOf("coverUrl", "extraInfo", "downloadInfo").any { col(it).isNotBlank() } || hasExtractedCoverCache(path)
-                    val book = CalendarMetaBook(path, title, author, lastAccess, coverHint)
+                    val book = CalendarMetaBook(path, title, author, coverHint)
                     metaByPath[path] = book
-                    metaByName[File(path).name] = book
                 }
             }
 
@@ -2277,8 +2590,7 @@ class MainActivity : ComponentActivity() {
             var statsRowsWithPath = 0
             var exactMatches = 0
             var nameMatches = 0
-            var timeMatches = 0
-            var unmatched = 0
+            val rawEvents = mutableListOf<ReadingEventAttribution.Event>()
             contentResolver.query(
                 statsUri,
                 arrayOf("path", "eventTime", "durationTime"),
@@ -2300,29 +2612,43 @@ class MainActivity : ComponentActivity() {
                     val dayStart = startOfDayMs(eventMs)
                     val day = days.getOrPut(dayStart) { CalendarDayStat() }
                     day.events += 1
-                    day.durationMs += dur
-                    val matchedBook = if (path.isNotBlank()) {
+                    if (path.isNotBlank()) {
                         statsRowsWithPath += 1
                         day.withPath += 1
-                        metaByPath[path]?.also { exactMatches += 1 }
-                            ?: metaByName[File(path).name]?.also { nameMatches += 1 }
                     } else {
                         day.orphan += 1
-                        null
-                    } ?: findNearestCalendarBook(metaByPath.values, eventMs)?.also {
-                        timeMatches += 1
                     }
-
-                    if (matchedBook == null) {
-                        day.unmatched += 1
-                        unmatched += 1
-                    } else {
-                        day.matched += 1
-                        day.books[matchedBook.title] = (day.books[matchedBook.title] ?: 0L) + dur
-                        if (matchedBook.hasCoverHint) day.coverBooks.add(matchedBook.title)
-                    }
+                    rawEvents += ReadingEventAttribution.Event(path, eventMs, dur)
                 }
             }
+
+            val attribution = ReadingEventAttribution.attribute(
+                rawEvents,
+                metaByPath.values.map { ReadingEventAttribution.Book(it.path, true) }
+            )
+            attribution.matches.forEach { match ->
+                val day = days.getOrPut(startOfDayMs(match.event.timestampMs)) { CalendarDayStat() }
+                val matchedBook = metaByPath[match.book.path] ?: return@forEach
+                day.matched += 1
+                day.durationMs += match.event.durationMs
+                day.books[matchedBook.title] =
+                    (day.books[matchedBook.title] ?: 0L) + match.event.durationMs
+                if (matchedBook.hasCoverHint) day.coverBooks.add(matchedBook.title)
+                when (match.confidence) {
+                    ReadingEventAttribution.Confidence.EXACT_PATH -> exactMatches += 1
+                    ReadingEventAttribution.Confidence.UNIQUE_FILE_NAME -> nameMatches += 1
+                }
+            }
+            attribution.unmatched.forEach { event ->
+                val day = days.getOrPut(startOfDayMs(event.event.timestampMs)) { CalendarDayStat() }
+                day.unmatched += 1
+            }
+            val unmatchedReasons = attribution.unmatched
+                .groupingBy { it.reason }
+                .eachCount()
+                .entries
+                .joinToString(",") { "${it.key}=${it.value}" }
+                .ifBlank { "none" }
 
             val out = StringBuilder()
             out.append("range=").append(dateFmt.format(Date(start))).append("~").append(dateFmt.format(Date(end))).append('\n')
@@ -2331,8 +2657,8 @@ class MainActivity : ComponentActivity() {
                 .append(", metadata=").append(metaByPath.size)
                 .append(", exactMatches=").append(exactMatches)
                 .append(", nameMatches=").append(nameMatches)
-                .append(", timeMatches=").append(timeMatches)
-                .append(", unmatched=").append(unmatched)
+                .append(", unmatched=").append(attribution.unmatched.size)
+                .append(", unmatchedReasons=").append(unmatchedReasons)
                 .append('\n')
             days.entries.forEach { (dayStart, stat) ->
                 if (stat.events == 0 && stat.books.isEmpty()) return@forEach
@@ -2356,21 +2682,6 @@ class MainActivity : ComponentActivity() {
         }.onFailure {
             localCalendarProbeReport = "error=${it.javaClass.simpleName}:${it.message}"
         }
-    }
-
-    private fun findNearestCalendarBook(books: Collection<CalendarMetaBook>, eventMs: Long): CalendarMetaBook? {
-        val maxDelta = 12L * 60L * 60L * 1000L
-        var best: CalendarMetaBook? = null
-        var bestDelta = Long.MAX_VALUE
-        books.forEach { book ->
-            if (book.lastAccessMs <= 0L) return@forEach
-            val delta = kotlin.math.abs(book.lastAccessMs - eventMs)
-            if (delta < bestDelta) {
-                best = book
-                bestDelta = delta
-            }
-        }
-        return if (bestDelta <= maxDelta) best else null
     }
 
     private fun hasExtractedCoverCache(path: String): Boolean {
@@ -2678,18 +2989,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun saveBitmapToPictures(bitmap: Bitmap): String {
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "NeoReader")
-        if (!dir.exists()) dir.mkdirs()
-        val file = File(dir, "neoreader_wallpaper.png")
-        FileOutputStream(file).use { out -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, out) }
-        runCatching {
-            android.media.MediaScannerConnection.scanFile(
-                this,
-                arrayOf(file.absolutePath),
-                arrayOf("image/png")
-            ) { _, _ -> }
-        }
-        return file.absolutePath
+        return WallpaperFileStore.save(this, bitmap)
     }
 
     private fun dumpTextTree(view: View, maxItems: Int = 80): String {

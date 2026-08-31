@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
@@ -15,6 +16,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 
 class ScreenOffMonitorService : Service() {
     private var receiver: BroadcastReceiver? = null
@@ -24,7 +27,16 @@ class ScreenOffMonitorService : Service() {
         super.onCreate()
         AutoRefreshLog.i(this, "ScreenOffMonitorService.onCreate")
         ensureChannel()
-        startForeground(17731, buildNotification())
+        ServiceCompat.startForeground(
+            this,
+            17731,
+            buildNotification(),
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            } else {
+                0
+            }
+        )
         
         // 1. Register display state receiver
         val r = object : BroadcastReceiver() {
@@ -44,7 +56,12 @@ class ScreenOffMonitorService : Service() {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
         }
-        registerReceiver(r, filter)
+        ContextCompat.registerReceiver(
+            this,
+            r,
+            filter,
+            AutoRefreshReasonPolicy.screenStateReceiverFlags()
+        )
         receiver = r
 
         // 2. Register NeoReader database observer
@@ -52,15 +69,27 @@ class ScreenOffMonitorService : Service() {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
                 AutoRefreshLog.i(this@ScreenOffMonitorService, "ScreenOffMonitorService content_changed uri=$uri")
-                AutoRefreshWorker.enqueue(this@ScreenOffMonitorService, "book_content_changed")
+                val reason = if (uri?.authority == "com.onyx.kreader.statistics.provider") {
+                    "reading_stats_changed"
+                } else {
+                    "book_content_changed"
+                }
+                AutoRefreshWorker.enqueue(this@ScreenOffMonitorService, reason)
             }
         }
         contentObserver = observer
-        contentResolver.registerContentObserver(
+        listOf(
             Uri.parse("content://com.onyx.content.database.ContentProvider/Metadata"),
-            true, // notifyForDescendants
-            observer
-        )
+            Uri.parse("content://com.onyx.kreader.statistics.provider/OnyxStatisticsModel")
+        ).forEach { uri ->
+            runCatching {
+                contentResolver.registerContentObserver(uri, true, observer)
+            }.onSuccess {
+                AutoRefreshLog.i(this, "ScreenOffMonitorService observer registered uri=$uri")
+            }.onFailure {
+                AutoRefreshLog.e(this, "ScreenOffMonitorService observer registration failed uri=$uri", it)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {

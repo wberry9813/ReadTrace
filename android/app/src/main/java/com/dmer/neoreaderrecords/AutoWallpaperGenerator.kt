@@ -11,6 +11,7 @@ import android.graphics.pdf.PdfRenderer
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
+import android.os.Build
 import android.os.Environment
 import android.os.ParcelFileDescriptor
 import com.google.zxing.BarcodeFormat
@@ -51,8 +52,8 @@ object AutoWallpaperGenerator {
     )
     private data class MetadataBook(
         val path: String,
-        val lastAccessMs: Long,
-        val item: BookItem
+        val item: BookItem,
+        val eligible: Boolean = true
     )
     private data class CalendarCoverItem(
         val title: String,
@@ -81,7 +82,7 @@ object AutoWallpaperGenerator {
         val statsRows: Int,
         val matchedRows: Int,
         val unmatchedRows: Int,
-        val footerLabel: String = "Neo 本地月历 · 近似匹配",
+        val footerLabel: String = "Neo 本地月历 · 严格路径归属",
         val showDurationOnlyLabel: Boolean = true,
         val showFooterLabel: Boolean = true,
         val showDaySourceLabel: Boolean = false
@@ -93,6 +94,13 @@ object AutoWallpaperGenerator {
         val gridStart: Long
     )
     private data class ChartStats(val totalMs: Long, val points: LongArray, val labels: List<String>)
+    private data class LocalDurationData(
+        val events: List<Pair<Long, Long>>,
+        val chart: ChartStats,
+        val books: List<Pair<BookItem, Long>>,
+        val unmatchedCount: Int,
+        val unmatchedDurationMs: Long
+    )
     private data class WallpaperSize(val label: String, val width: Int, val height: Int)
     private data class WeReadBuildData(
         val rangeStart: Long,
@@ -640,12 +648,17 @@ object AutoWallpaperGenerator {
             if (s.wallpaperMode == "COVER") return null
         }
         val range = resolvePeriodRange(s) ?: return null
+        val localDurationData = if (s.sourceMode == "DURATION") {
+            loadLocalDurationData(context, range.first, range.second, s)
+        } else {
+            null
+        }
         val books = if (s.sourceMode == "DURATION") {
             enrichExcerptMenuBooks(
                 context,
                 "",
-                queryTopBooksByDuration(context, range.first, range.second, s)
-                .take(s.topN)
+                requireNotNull(localDurationData).books
+                    .take(s.topN)
                     .map { it.first.copy(menuPriceText = menuPriceText(it.second)) to it.second },
                 s,
                 fetchWeReadExcerpt = false
@@ -660,7 +673,8 @@ object AutoWallpaperGenerator {
                 fetchWeReadExcerpt = false
             )
         }
-        val stats = queryStatsByMode(context.contentResolver, range.first, range.second, s)
+        val stats = localDurationData?.chart
+            ?: queryStatsByMode(context.contentResolver, range.first, range.second, s)
         AutoRefreshLog.i(
             context,
             "Local stats books source=${s.sourceMode} books=${books.size} withDuration=${books.count { !it.durationText.isNullOrBlank() }}"
@@ -673,6 +687,10 @@ object AutoWallpaperGenerator {
             append(", TopN=").append(s.topN)
             append(", 书籍=").append(books.size)
             append(", 时长=").append(formatDuration(stats.totalMs, s.timeUnit))
+            if (localDurationData != null && localDurationData.unmatchedCount > 0) {
+                append(", 未归属=").append(localDurationData.unmatchedCount)
+                append("条/").append(formatDuration(localDurationData.unmatchedDurationMs, s.timeUnit))
+            }
             append(", 输出=").append(canvasSizeText(s))
         }
         return PreviewResult(bmp, summary)
@@ -887,15 +905,13 @@ object AutoWallpaperGenerator {
     ): CalendarBuildData? {
         val metadata = loadCalendarMetadata(context, s)
         val metadataByPath = metadata.associateBy { it.path }
-        val candidates = metadata.filter { it.lastAccessMs > 0L }.ifEmpty { metadata }
         val durationByDayPath = linkedMapOf<Long, LinkedHashMap<String, Long>>()
         val latestEventByDayPath = linkedMapOf<Long, LinkedHashMap<String, Long>>()
         val eventsByDay = linkedMapOf<Long, Int>()
         val unmatchedByDay = linkedMapOf<Long, Int>()
+        val rawEvents = mutableListOf<ReadingEventAttribution.Event>()
         val minMs = s.minDurationMinutes * 60_000L
         var rows = 0
-        var matchedRows = 0
-        var unmatchedRows = 0
         var querySucceeded = false
 
         context.contentResolver.query(
@@ -911,27 +927,38 @@ object AutoWallpaperGenerator {
                 val rawEvent = readColString(c, "eventTime")?.toLongOrNull() ?: continue
                 val eventMs = normalizeEpochMs(rawEvent)
                 val durationMs = readColString(c, "durationTime")?.toLongOrNull() ?: 0L
-                if (durationMs < minMs) continue
+                if (eventMs <= 0L || durationMs < minMs) continue
                 val day = startOfDayMs(eventMs)
                 eventsByDay[day] = (eventsByDay[day] ?: 0) + 1
-                val rawPath = readColString(c, "path").orEmpty()
-                val matchedPath = when {
-                    rawPath.isNotBlank() && metadataByPath.containsKey(rawPath) -> rawPath
-                    rawPath.isNotBlank() -> rawPath
-                    else -> nearestMetadataPath(eventMs, candidates, monthStart, monthEnd)
-                }
-                if (matchedPath.isNullOrBlank()) {
-                    unmatchedRows += 1
-                    unmatchedByDay[day] = (unmatchedByDay[day] ?: 0) + 1
-                    continue
-                }
-                matchedRows += 1
-                val dayMap = durationByDayPath.getOrPut(day) { linkedMapOf() }
-                dayMap[matchedPath] = (dayMap[matchedPath] ?: 0L) + durationMs
-                val latestMap = latestEventByDayPath.getOrPut(day) { linkedMapOf() }
-                latestMap[matchedPath] = maxOf(latestMap[matchedPath] ?: 0L, eventMs)
+                rawEvents += ReadingEventAttribution.Event(
+                    path = readColString(c, "path").orEmpty(),
+                    timestampMs = eventMs,
+                    durationMs = durationMs
+                )
             }
         }
+
+        val attribution = ReadingEventAttribution.attribute(
+            rawEvents,
+            metadata.map { ReadingEventAttribution.Book(it.path, it.eligible) }
+        )
+        attribution.matches.forEach { match ->
+            val day = startOfDayMs(match.event.timestampMs)
+            val matchedPath = match.book.path
+            val dayMap = durationByDayPath.getOrPut(day) { linkedMapOf() }
+            dayMap[matchedPath] = (dayMap[matchedPath] ?: 0L) + match.event.durationMs
+            val latestMap = latestEventByDayPath.getOrPut(day) { linkedMapOf() }
+            latestMap[matchedPath] = maxOf(
+                latestMap[matchedPath] ?: 0L,
+                match.event.timestampMs
+            )
+        }
+        attribution.unmatched.forEach { unmatched ->
+            val day = startOfDayMs(unmatched.event.timestampMs)
+            unmatchedByDay[day] = (unmatchedByDay[day] ?: 0) + 1
+        }
+        val matchedRows = attribution.matches.size
+        val unmatchedRows = attribution.unmatched.size
 
         val cells = (0 until weekRows * 7).map { index ->
             val dayMs = gridStart + index * DAY_MS
@@ -1116,13 +1143,10 @@ object AutoWallpaperGenerator {
                 val path = readColString(c, "nativeAbsolutePath").orEmpty()
                 if (path.isBlank()) continue
                 val status = readColString(c, "readingStatus")?.toIntOrNull() ?: 0
-                if (!s.includeUnread && status == 0) continue
-                if (s.readingFilterMode == "READING_ONLY" && status != 1) continue
-                if (s.readingFilterMode == "FINISHED_ONLY" && status != 2) continue
+                val eligible = isEligibleLocalStatus(status, s)
                 out.add(
                     MetadataBook(
                         path = path,
-                        lastAccessMs = normalizeEpochMs(readColString(c, "lastAccess")?.toLongOrNull() ?: 0L),
                         item = BookItem(
                             bookId = null,
                             title = readColString(c, "title") ?: File(path).nameWithoutExtension.ifBlank { "未知书名" },
@@ -1130,24 +1154,13 @@ object AutoWallpaperGenerator {
                             progress = readColString(c, "progress"),
                             status = status,
                             localKeys = localBookKeys(c)
-                        )
+                        ),
+                        eligible = eligible
                     )
                 )
             }
         }
         return out
-    }
-
-    private fun nearestMetadataPath(eventMs: Long, candidates: List<MetadataBook>, monthStart: Long, monthEnd: Long): String? {
-        if (candidates.isEmpty()) return null
-        val maxDelta = when {
-            monthEnd - monthStart <= 8L * DAY_MS -> 3L * DAY_MS
-            else -> 10L * DAY_MS
-        }
-        val best = candidates.minByOrNull { kotlin.math.abs(it.lastAccessMs - eventMs) } ?: return null
-        if (best.lastAccessMs <= 0L) return null
-        val delta = kotlin.math.abs(best.lastAccessMs - eventMs)
-        return if (delta <= maxDelta) best.path else null
     }
 
     private fun loadCalendarCoverBitmap(context: Context, path: String): Bitmap? {
@@ -1232,21 +1245,29 @@ object AutoWallpaperGenerator {
             points = if (values.isNotEmpty()) values else longArrayOf(0L),
             labels = if (labels.isNotEmpty()) labels else listOf(weReadPeriodLabel(s.periodMode))
         )
-        val books = enrichExcerptMenuBooks(
-            context,
-            key,
+        val useMonthlyRanking = ReadingPeriodScope.coversWholeMonths(range.first, range.second)
+        val scopedBooks = if (useMonthlyRanking) {
             bookMap.values
                 .sortedByDescending { it.readSeconds }
                 .map { toWeReadBookItem(context, key, it) to it.readSeconds * 1000L }
                 .filter { matchesReadingFilter(it.first, s) }
-                .take(s.topN),
+                .take(s.topN)
+        } else {
+            buildTrackedWeReadBooksForRange(context, range.first, range.second, s)
+                .take(s.topN)
+        }
+        val books = enrichExcerptMenuBooks(
+            context,
+            key,
+            scopedBooks,
             s,
             fetchWeReadExcerpt = true
         )
-        val note = if (monthStarts.size > 1 || s.periodMode != "LAST_30_DAYS") {
-            "时长按日分桶精确过滤，书单按覆盖月份排行合并"
-        } else {
-            "时长按日分桶过滤"
+        val note = when {
+            useMonthlyRanking -> "时长与书单均按完整月份统计"
+            AutoRefreshConfig.isReadingDataStoreEnabled(context) ->
+                "时长按日分桶，书单来自本机确认的日级阅读增量"
+            else -> "时长按日分桶；当前周期无法可靠归属书籍，已隐藏月度排行"
         }
         AutoRefreshLog.i(context, "WeRead range stats period=${s.periodMode} range=${fmt(range.first)}~${fmt(range.second)} months=${monthStarts.size} buckets=${sortedBuckets.size} totalSec=${totalMs / 1000L} books=${books.size}")
         return WeReadBuildData(range.first, range.second, chart, books, weReadPeriodLabel(s.periodMode), note)
@@ -1254,7 +1275,8 @@ object AutoWallpaperGenerator {
 
     private fun buildMixedStatsForSettings(context: Context, s: AutoSettings): WeReadBuildData? {
         val range = resolvePeriodRange(s) ?: return null
-        val localEvents = collectDurationEvents(context.contentResolver, range.first, range.second, s.minDurationMinutes)
+        val localDurationData = loadLocalDurationData(context, range.first, range.second, s)
+        val localEvents = localDurationData.events
         val weReadEvents = mutableListOf<Pair<Long, Long>>()
         val weReadBookScores = linkedMapOf<String, Pair<WeReadClient.WallpaperBook, Long>>()
         val monthStarts = monthStartsBetween(range.first, range.second)
@@ -1287,16 +1309,24 @@ object AutoWallpaperGenerator {
         }
 
         val chart = bucketize(localEvents + weReadEvents, range.first, range.second, chooseBucketMode(s, range.first, range.second))
-        val localBooks = queryTopBooksByDuration(context, range.first, range.second, s)
-            .map { it.first to it.second }
-        val weReadBooks = weReadBookScores.values
-            .map { (book, scoreMs) ->
-                toWeReadBookItem(context, key, book).copy(durationText = formatDuration(scoreMs, s.timeUnit), menuPriceText = menuPriceText(scoreMs)) to scoreMs
-            }
-            .filter { matchesReadingFilter(it.first, s) }
+        val localBooks = localDurationData.books
+        val useMonthlyRanking = ReadingPeriodScope.coversWholeMonths(range.first, range.second)
+        val weReadBooks = if (useMonthlyRanking) {
+            weReadBookScores.values
+                .map { (book, scoreMs) ->
+                    toWeReadBookItem(context, key, book).copy(
+                        durationText = formatDuration(scoreMs, s.timeUnit),
+                        menuPriceText = menuPriceText(scoreMs)
+                    ) to scoreMs
+                }
+                .filter { matchesReadingFilter(it.first, s) }
+        } else {
+            buildTrackedWeReadBooksForRange(context, range.first, range.second, s)
+        }
         val mergedBooks = enrichExcerptMenuBooks(context, key, mergeScoredBooksWithScores(localBooks + weReadBooks, s.topN, s.timeUnit), s, fetchWeReadExcerpt = true)
         val note = buildString {
             append("本地+微信，图表按时间相加，书单按阅读时长合并排序")
+            if (!useMonthlyRanking) append("；微信书单仅使用本机确认的日级增量")
             if (weReadFailures.isNotEmpty()) {
                 append("；微信读书读取失败，已使用本地数据")
                 if (weReadEvents.isNotEmpty() || weReadBooks.isNotEmpty()) append("和已读取到的微信数据")
@@ -1397,18 +1427,16 @@ object AutoWallpaperGenerator {
         }
     }
 
-    private fun queryTopBooksByDuration(
+    private fun loadLocalDurationData(
         context: Context,
         start: Long,
         end: Long,
         s: AutoSettings
-    ): List<Pair<BookItem, Long>> {
+    ): LocalDurationData {
         val resolver = context.contentResolver
-        val durationByPath = linkedMapOf<String, Long>()
-        val orphanEvents = mutableListOf<Pair<Long, Long>>()
+        val rawEvents = mutableListOf<ReadingEventAttribution.Event>()
         val minMs = s.minDurationMinutes * 60_000L
         var statsRows = 0
-        var statsRowsWithPath = 0
         resolver.query(
             statsUri,
             arrayOf("path", "eventTime", "durationTime"),
@@ -1419,15 +1447,11 @@ object AutoWallpaperGenerator {
             while (c.moveToNext()) {
                 statsRows += 1
                 val path = c.getString(c.getColumnIndexOrThrow("path")).orEmpty()
-                val event = c.getString(c.getColumnIndexOrThrow("eventTime"))?.toLongOrNull() ?: 0L
+                val rawEvent = c.getString(c.getColumnIndexOrThrow("eventTime"))?.toLongOrNull() ?: 0L
                 val dur = c.getString(c.getColumnIndexOrThrow("durationTime"))?.toLongOrNull() ?: 0L
-                if (dur < minMs) continue
-                if (path.isBlank()) {
-                    if (event > 0L) orphanEvents.add(normalizeEpochMs(event) to dur)
-                } else {
-                    statsRowsWithPath += 1
-                    durationByPath[path] = (durationByPath[path] ?: 0L) + dur
-                }
+                val eventMs = normalizeEpochMs(rawEvent)
+                if (eventMs <= 0L || dur < minMs) continue
+                rawEvents += ReadingEventAttribution.Event(path, eventMs, dur)
             }
         }
 
@@ -1443,12 +1467,8 @@ object AutoWallpaperGenerator {
                 val path = c.getString(c.getColumnIndexOrThrow("nativeAbsolutePath")).orEmpty()
                 if (path.isBlank()) continue
                 val status = c.getString(c.getColumnIndexOrThrow("readingStatus"))?.toIntOrNull() ?: 0
-                if (!s.includeUnread && status == 0) continue
-                if (s.readingFilterMode == "READING_ONLY" && status != 1) continue
-                if (s.readingFilterMode == "FINISHED_ONLY" && status != 2) continue
                 metadata[path] = MetadataBook(
                     path = path,
-                    lastAccessMs = normalizeEpochMs(c.getString(c.getColumnIndexOrThrow("lastAccess"))?.toLongOrNull() ?: 0L),
                     item = BookItem(
                         null,
                         c.getString(c.getColumnIndexOrThrow("title")) ?: File(path).nameWithoutExtension,
@@ -1456,53 +1476,48 @@ object AutoWallpaperGenerator {
                         c.getString(c.getColumnIndexOrThrow("progress")),
                         status,
                         localKeys = localBookKeys(c)
-                    )
+                    ),
+                    eligible = isEligibleLocalStatus(status, s)
                 )
             }
         }
 
-        var timeMatched = 0
-        var timeUnmatched = 0
-        if (orphanEvents.isNotEmpty() && metadata.isNotEmpty()) {
-            val candidates = metadata.values
-                .filter { it.lastAccessMs > 0L }
-                .ifEmpty { metadata.values.toList() }
-            val maxDelta = when {
-                end - start <= DAY_MS -> 12L * 60L * 60L * 1000L
-                end - start <= 8L * DAY_MS -> 3L * DAY_MS
-                else -> 10L * DAY_MS
-            }
-            orphanEvents.forEach { (eventMs, dur) ->
-                val best = candidates.minByOrNull {
-                    val access = if (it.lastAccessMs > 0L) it.lastAccessMs else start
-                    kotlin.math.abs(access - eventMs)
-                }
-                val bestAccess = best?.lastAccessMs ?: 0L
-                val delta = if (best != null && bestAccess > 0L) kotlin.math.abs(bestAccess - eventMs) else Long.MAX_VALUE
-                if (best != null && delta <= maxDelta) {
-                    durationByPath[best.path] = (durationByPath[best.path] ?: 0L) + dur
-                    timeMatched += 1
-                } else {
-                    timeUnmatched += 1
-                }
-            }
+        val attribution = ReadingEventAttribution.attribute(
+            rawEvents,
+            metadata.values.map { ReadingEventAttribution.Book(it.path, it.eligible) }
+        )
+        val durationByPath = linkedMapOf<String, Long>()
+        val matchedEvents = attribution.matches.map { match ->
+            durationByPath[match.book.path] =
+                (durationByPath[match.book.path] ?: 0L) + match.event.durationMs
+            match.event.timestampMs to match.event.durationMs
         }
-
-        AutoRefreshLog.i(context, "Local duration book match rows=$statsRows rowsWithPath=$statsRowsWithPath orphan=${orphanEvents.size} timeMatched=$timeMatched timeUnmatched=$timeUnmatched metadata=${metadata.size} durationBooks=${durationByPath.size}")
-
-        if (durationByPath.isEmpty()) return queryTopBooks(
-            resolver,
-            start,
-            end,
-            s.topN,
-            s.includeUnread,
-            s.readingFilterMode
-        ).mapIndexed { idx, item -> item to ((s.topN - idx).coerceAtLeast(1) * 60_000L).toLong() }
-
-        return durationByPath.mapNotNull { (path, ms) ->
-            val item = metadata[path]?.item ?: BookItem(null, File(path).nameWithoutExtension, null, null, 1)
-            item.copy(durationText = formatDuration(ms, s.timeUnit)) to ms
+        val metadataByNormalizedPath = metadata.values.associateBy {
+            ReadingEventAttribution.normalizePath(it.path)
+        }
+        val books = durationByPath.mapNotNull { (path, durationMs) ->
+            val item = metadataByNormalizedPath[ReadingEventAttribution.normalizePath(path)]?.item
+                ?: return@mapNotNull null
+            item.copy(durationText = formatDuration(durationMs, s.timeUnit)) to durationMs
         }.sortedByDescending { it.second }
+        val unmatchedDurationMs = attribution.unmatched.sumOf { it.event.durationMs }
+        val unmatchedReasons = attribution.unmatched
+            .groupingBy { it.reason }
+            .eachCount()
+            .entries
+            .joinToString(",") { "${it.key}=${it.value}" }
+            .ifBlank { "none" }
+        AutoRefreshLog.i(
+            context,
+            "Local duration attribution rows=$statsRows accepted=${rawEvents.size} matched=${attribution.matches.size} unmatched=${attribution.unmatched.size} unmatchedMs=$unmatchedDurationMs reasons=$unmatchedReasons metadata=${metadata.size} books=${books.size}"
+        )
+        return LocalDurationData(
+            events = matchedEvents,
+            chart = bucketize(matchedEvents, start, end, chooseBucketMode(s, start, end)),
+            books = books,
+            unmatchedCount = attribution.unmatched.size,
+            unmatchedDurationMs = unmatchedDurationMs
+        )
     }
 
     private fun toWeReadBookItem(context: Context, apiKey: String, book: WeReadClient.WallpaperBook): BookItem {
@@ -1519,7 +1534,6 @@ object AutoWallpaperGenerator {
             book.readSeconds > 0L -> 1
             else -> 0
         }
-        val durationSeconds = progress?.recordReadingSeconds?.takeIf { it > 0L } ?: book.readSeconds
         return BookItem(
             bookId = book.bookId,
             title = book.title,
@@ -1527,8 +1541,43 @@ object AutoWallpaperGenerator {
             progress = null,
             status = status,
             progressText = progressText,
-            durationText = WeReadClient.formatSeconds(durationSeconds)
+            durationText = WeReadClient.formatSeconds(book.readSeconds)
         )
+    }
+
+    private fun buildTrackedWeReadBooksForRange(
+        context: Context,
+        startMs: Long,
+        endMs: Long,
+        s: AutoSettings
+    ): List<Pair<BookItem, Long>> {
+        if (!AutoRefreshConfig.isReadingDataStoreEnabled(context)) return emptyList()
+        val dateFormat = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val records = ReadingDataStore.queryDailyBooks(
+            context,
+            "WEREAD",
+            dateFormat.format(Date(startMs)),
+            dateFormat.format(Date(endMs))
+        ).filter { it.durationMs > 0L }
+
+        return records
+            .groupBy { it.bookKey }
+            .mapNotNull { (bookKey, bookRecords) ->
+                val latest = bookRecords.maxByOrNull { it.lastSeenAt } ?: return@mapNotNull null
+                val durationMs = bookRecords.sumOf { it.durationMs }
+                val item = BookItem(
+                    bookId = bookKey,
+                    title = latest.title,
+                    author = latest.author,
+                    progress = latest.progress,
+                    status = latest.status,
+                    progressText = latest.progress,
+                    durationText = formatDuration(durationMs, s.timeUnit),
+                    menuPriceText = menuPriceText(durationMs)
+                )
+                if (matchesReadingFilter(item, s)) item to durationMs else null
+            }
+            .sortedByDescending { it.second }
     }
 
     private fun matchesReadingFilter(book: BookItem, s: AutoSettings): Boolean {
@@ -1536,6 +1585,15 @@ object AutoWallpaperGenerator {
         return when (s.readingFilterMode) {
             "READING_ONLY" -> book.status == 1
             "FINISHED_ONLY" -> book.status == 2
+            else -> true
+        }
+    }
+
+    private fun isEligibleLocalStatus(status: Int, s: AutoSettings): Boolean {
+        if (!s.includeUnread && status == 0) return false
+        return when (s.readingFilterMode) {
+            "READING_ONLY" -> status == 1
+            "FINISHED_ONLY" -> status == 2
             else -> true
         }
     }
@@ -3026,8 +3084,18 @@ object AutoWallpaperGenerator {
             else -> {
                 try {
                     if (spec.startsWith("content://")) {
-                        context.contentResolver.openFileDescriptor(Uri.parse(spec), "r")?.use { pfd ->
-                            Typeface.Builder(pfd.fileDescriptor).build()
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                            context.contentResolver.openFileDescriptor(Uri.parse(spec), "r")?.use { pfd ->
+                                Typeface.Builder(pfd.fileDescriptor).build()
+                            }
+                        } else {
+                            val cacheFile = File(context.cacheDir, "font_${spec.hashCode()}.cache")
+                            if (!cacheFile.exists() || cacheFile.length() == 0L) {
+                                context.contentResolver.openInputStream(Uri.parse(spec))?.use { input ->
+                                    FileOutputStream(cacheFile).use { output -> input.copyTo(output) }
+                                }
+                            }
+                            cacheFile.takeIf { it.length() > 0L }?.let(Typeface::createFromFile)
                         } ?: Typeface.create(Typeface.SANS_SERIF, if (boldDefault) Typeface.BOLD else Typeface.NORMAL)
                     } else {
                         Typeface.createFromFile(spec)
@@ -3163,19 +3231,6 @@ object AutoWallpaperGenerator {
     }
 
     private fun saveBitmap(context: android.content.Context, bitmap: Bitmap): String {
-        val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "NeoReader")
-        if (!dir.exists()) dir.mkdirs()
-        val file = File(dir, "neoreader_wallpaper.png")
-        FileOutputStream(file).use { out -> bitmap.compress(Bitmap.CompressFormat.PNG, 100, out) }
-        runCatching {
-            android.media.MediaScannerConnection.scanFile(
-                context,
-                arrayOf(file.absolutePath),
-                arrayOf("image/png")
-            ) { path, uri ->
-                AutoRefreshLog.i(context, "MediaScanner scanned updated image: uri=$uri")
-            }
-        }
-        return file.absolutePath
+        return WallpaperFileStore.save(context, bitmap)
     }
 }

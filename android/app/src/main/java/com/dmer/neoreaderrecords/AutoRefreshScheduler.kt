@@ -4,6 +4,7 @@ import android.app.AlarmManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.os.Build
 import java.util.Calendar
 import java.util.Locale
 
@@ -12,6 +13,12 @@ object AutoRefreshScheduler {
 
     fun reschedule(context: Context) {
         cancelDaily(context)
+        if (!AutoRefreshConfig.isEnabled(context)) return
+        if (AutoRefreshConfig.mode(context) != AutoRefreshConfig.MODE_DAILY) return
+        scheduleNext(context)
+    }
+
+    fun scheduleNext(context: Context) {
         if (!AutoRefreshConfig.isEnabled(context)) return
         if (AutoRefreshConfig.mode(context) != AutoRefreshConfig.MODE_DAILY) return
         scheduleDaily(context, AutoRefreshConfig.dailyTime(context))
@@ -24,15 +31,32 @@ object AutoRefreshScheduler {
         pi.cancel()
     }
 
+    fun canScheduleExact(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return true
+        val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return false
+        return am.canScheduleExactAlarms()
+    }
+
     private fun scheduleDaily(context: Context, hhmm: String) {
         val am = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
         val pi = dailyPendingIntent(context, PendingIntent.FLAG_UPDATE_CURRENT) ?: return
         val first = computeNextTrigger(hhmm)
-        am.setInexactRepeating(
-            AlarmManager.RTC_WAKEUP,
-            first,
-            AlarmManager.INTERVAL_DAY,
-            pi
+        val exactAllowed = canScheduleExact(context)
+        val exactScheduled = exactAllowed && runCatching {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, first, pi)
+        }.onFailure {
+            AutoRefreshLog.e(context, "exact daily alarm scheduling failed; falling back", it)
+        }.isSuccess
+        if (!exactScheduled) {
+            runCatching {
+                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, first, pi)
+            }.onFailure {
+                AutoRefreshLog.e(context, "inexact daily alarm scheduling failed", it)
+            }
+        }
+        AutoRefreshLog.i(
+            context,
+            "daily alarm scheduled trigger=$first exact=$exactScheduled time=$hhmm"
         )
     }
 
