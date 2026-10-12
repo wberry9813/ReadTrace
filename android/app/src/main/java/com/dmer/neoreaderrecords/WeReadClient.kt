@@ -20,7 +20,11 @@ object WeReadClient {
     private const val KEY_LAST_COVER_PATH = "weread_last_cover_path"
     private const val KEY_LAST_COVER_BYTES = "weread_last_cover_bytes"
     private const val API_GATEWAY = "https://i.weread.qq.com/api/agent/gateway"
-    private const val SKILL_VERSION = "1.0.4"
+    // 与官方 skills/SKILL.md 核对接口契约后更新，不能自动跟随服务端版本号。
+    private const val SKILL_VERSION = "1.0.5"
+
+    internal fun upgradeRequiredMessage(): String =
+        "微信读书接口适配需更新，请检查并安装新版阅迹壁纸后重试。当前适配版本 $SKILL_VERSION；此提示不代表 API Key 已过期，无需手动下载 Skill 文件。"
 
     data class State(
         val maskedKey: String,
@@ -163,7 +167,7 @@ object WeReadClient {
             val json = JSONObject(result.body)
             val upgradeInfo = json.optJSONObject("upgrade_info")
             if (upgradeInfo != null) {
-                return saveFailure(context, "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}")
+                return saveFailure(context, upgradeRequiredMessage())
             }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
@@ -213,7 +217,7 @@ object WeReadClient {
             val json = JSONObject(result.body)
             val upgradeInfo = json.optJSONObject("upgrade_info")
             if (upgradeInfo != null) {
-                return ReadStatsResult(false, "读取失败", "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}", mode, 0L, 0L, 0, emptyList())
+                return ReadStatsResult(false, "读取失败", upgradeRequiredMessage(), mode, 0L, 0L, 0, emptyList())
             }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
@@ -265,7 +269,7 @@ object WeReadClient {
             val json = JSONObject(result.body)
             val upgradeInfo = json.optJSONObject("upgrade_info")
             if (upgradeInfo != null) {
-                return CoverCacheResult(false, "缓存失败", "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}", "", "", "", "", "", 0L, false)
+                return CoverCacheResult(false, "缓存失败", upgradeRequiredMessage(), "", "", "", "", "", 0L, false)
             }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
@@ -364,7 +368,7 @@ object WeReadClient {
             if (upgradeInfo != null) {
                 return ShelfSnapshotResult(
                     false,
-                    "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}",
+                    upgradeRequiredMessage(),
                     emptyList()
                 )
             }
@@ -501,7 +505,7 @@ object WeReadClient {
             val json = JSONObject(result.body)
             val upgradeInfo = json.optJSONObject("upgrade_info")
             if (upgradeInfo != null) {
-                return WallpaperStatsResult(false, "读取失败", "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}", mode, 0L, 0L, 0, emptyList(), emptyList())
+                return WallpaperStatsResult(false, "读取失败", upgradeRequiredMessage(), mode, 0L, 0L, 0, emptyList(), emptyList())
             }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
@@ -567,7 +571,7 @@ object WeReadClient {
             val json = JSONObject(result.body)
             val upgradeInfo = json.optJSONObject("upgrade_info")
             if (upgradeInfo != null) {
-                return BookProgressResult(false, null, 0L, 0L, "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}")
+                return BookProgressResult(false, null, 0L, 0L, upgradeRequiredMessage())
             }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
@@ -603,7 +607,7 @@ object WeReadClient {
                 val json = JSONObject(bookmarkResult.body)
                 val upgradeInfo = json.optJSONObject("upgrade_info")
                 if (upgradeInfo != null) {
-                    return LatestNoteResult(false, bookId, "", "", 0L, "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}")
+                    return LatestNoteResult(false, bookId, "", "", 0L, upgradeRequiredMessage())
                 }
                 if (json.optInt("errcode", 0) == 0) {
                     val updated = json.optJSONArray("updated")
@@ -630,7 +634,7 @@ object WeReadClient {
                 val json = JSONObject(reviewResult.body)
                 val upgradeInfo = json.optJSONObject("upgrade_info")
                 if (upgradeInfo != null) {
-                    return LatestNoteResult(false, bookId, "", "", 0L, "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}")
+                    return LatestNoteResult(false, bookId, "", "", 0L, upgradeRequiredMessage())
                 }
                 if (json.optInt("errcode", 0) == 0) {
                     val reviews = json.optJSONArray("reviews")
@@ -670,7 +674,7 @@ object WeReadClient {
             val json = JSONObject(result.body)
             val upgradeInfo = json.optJSONObject("upgrade_info")
             if (upgradeInfo != null) {
-                return LatestNoteResult(false, bookId, "", "", 0L, "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}")
+                return LatestNoteResult(false, bookId, "", "", 0L, upgradeRequiredMessage())
             }
             if (json.optInt("errcode", 0) != 0) {
                 return LatestNoteResult(false, bookId, "", "", 0L, "接口错误 errcode=${json.optInt("errcode", 0)}")
