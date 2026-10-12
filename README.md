@@ -381,6 +381,8 @@ App 会在打开时以及微信来源的解锁联网刷新时保存书架和本�
 
 本项目当前核心功能在 Android 原生 Kotlin 代码中。
 
+若未安装 Android Studio，可使用已有 JDK 17：将下方 `JAVA_HOME` 替换为实际 JDK 路径，并设置 `ANDROID_HOME` 指向 Android SDK。本项目缓存的 JDK 位于 `.gradle-home/jdks/`，可检查其中的 `Contents/Home/bin/java` 后使用。
+
 Debug 构建：
 
 ```sh
