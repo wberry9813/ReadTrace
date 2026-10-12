@@ -41,4 +41,13 @@ object AutoRefreshConfig {
             .getInt(KEY_SCREEN_OFF_MIN_INTERVAL, 3)
             .coerceIn(1, 240)
     }
+
+    fun disableScreenOffModeAfterServiceFailure(context: Context, reason: String) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUTO_ENABLED, false)
+            .putString(KEY_AUTO_MODE, MODE_DAILY)
+            .putString(KEY_LAST_REASON, "screen_off_service_failed:$reason")
+            .apply()
+    }
 }

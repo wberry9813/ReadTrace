@@ -23,8 +23,21 @@ class ScreenOffMonitorService : Service() {
     override fun onCreate() {
         super.onCreate()
         AutoRefreshLog.i(this, "ScreenOffMonitorService.onCreate")
-        ensureChannel()
-        startForeground(17731, buildNotification())
+        val foregroundOk = runCatching {
+            ensureChannel()
+            startForeground(17731, buildNotification())
+        }.onFailure {
+            AutoRefreshLog.e(this, "ScreenOffMonitorService startForeground failed", it)
+        }.isSuccess
+        if (!foregroundOk) {
+            AutoRefreshConfig.disableScreenOffModeAfterServiceFailure(
+                this,
+                "startForeground_failed"
+            )
+            AutoRefreshLog.i(this, "ScreenOffMonitorService disabled screen-off auto refresh after foreground failure")
+            stopSelf()
+            return
+        }
         
         // 1. Register display state receiver
         val r = object : BroadcastReceiver() {
@@ -44,10 +57,18 @@ class ScreenOffMonitorService : Service() {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_USER_PRESENT)
         }
-        registerReceiver(r, filter)
-        receiver = r
+        runCatching {
+            registerReceiver(r, filter)
+            receiver = r
+        }.onFailure {
+            AutoRefreshLog.e(this, "ScreenOffMonitorService registerReceiver failed", it)
+        }
 
         // 2. Register NeoReader database observer
+        if (!DevicePlatform.isBooxDevice()) {
+            AutoRefreshLog.i(this, "ScreenOffMonitorService skip Onyx observer device=${DevicePlatform.identityText()}")
+            return
+        }
         val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
             override fun onChange(selfChange: Boolean, uri: Uri?) {
                 super.onChange(selfChange, uri)
@@ -55,12 +76,16 @@ class ScreenOffMonitorService : Service() {
                 AutoRefreshWorker.enqueue(this@ScreenOffMonitorService, "book_content_changed")
             }
         }
-        contentObserver = observer
-        contentResolver.registerContentObserver(
-            Uri.parse("content://com.onyx.content.database.ContentProvider/Metadata"),
-            true, // notifyForDescendants
-            observer
-        )
+        runCatching {
+            contentResolver.registerContentObserver(
+                Uri.parse("content://com.onyx.content.database.ContentProvider/Metadata"),
+                true, // notifyForDescendants
+                observer
+            )
+            contentObserver = observer
+        }.onFailure {
+            AutoRefreshLog.e(this, "ScreenOffMonitorService registerContentObserver failed", it)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -75,7 +100,8 @@ class ScreenOffMonitorService : Service() {
         }
         receiver = null
         contentObserver?.let {
-            contentResolver.unregisterContentObserver(it)
+            runCatching { contentResolver.unregisterContentObserver(it) }
+                .onFailure { e -> AutoRefreshLog.e(this, "ScreenOffMonitorService unregisterContentObserver failed", e) }
         }
         contentObserver = null
         super.onDestroy()

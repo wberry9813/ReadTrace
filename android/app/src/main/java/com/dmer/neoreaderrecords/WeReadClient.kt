@@ -653,6 +653,46 @@ object WeReadClient {
         return LatestNoteResult(true, bookId, latest.text, latest.type, latest.createTimeMs, latest.type)
     }
 
+    fun fetchPopularBookmark(context: Context, apiKey: String, bookId: String): LatestNoteResult {
+        val key = apiKey.trim()
+        if (key.isBlank()) return LatestNoteResult(false, bookId, "", "", 0L, "未配置 API Key")
+        if (bookId.isBlank()) return LatestNoteResult(false, bookId, "", "", 0L, "缺少 bookId")
+        return try {
+            val body = JSONObject()
+                .put("api_name", "/book/bestbookmarks")
+                .put("bookId", bookId)
+                .put("chapterUid", 0)
+                .put("skill_version", SKILL_VERSION)
+                .toString()
+            val result = postJson(key, body)
+            AutoRefreshLog.i(context, "WeRead popular bookmark http bookId=${bookId.take(10)} code=${result.code} bytes=${result.body.length}")
+            if (result.code !in 200..299) return LatestNoteResult(false, bookId, "", "", 0L, "HTTP ${result.code}")
+            val json = JSONObject(result.body)
+            val upgradeInfo = json.optJSONObject("upgrade_info")
+            if (upgradeInfo != null) {
+                return LatestNoteResult(false, bookId, "", "", 0L, "Skill 需要升级：${upgradeInfo.optString("message", "请升级 skill")}")
+            }
+            if (json.optInt("errcode", 0) != 0) {
+                return LatestNoteResult(false, bookId, "", "", 0L, "接口错误 errcode=${json.optInt("errcode", 0)}")
+            }
+            val items = json.optJSONArray("items")
+                ?: return LatestNoteResult(true, bookId, "", "", 0L, "无热门划线")
+            var best = ""
+            for (i in 0 until items.length()) {
+                val text = items.optJSONObject(i)?.optString("markText")?.trim().orEmpty()
+                if (text.length >= 4 && (best.isBlank() || text.length < best.length)) best = text
+            }
+            if (best.isBlank()) {
+                LatestNoteResult(true, bookId, "", "", 0L, "无热门划线")
+            } else {
+                LatestNoteResult(true, bookId, best, "热门划线", 0L, "热门划线")
+            }
+        } catch (e: Exception) {
+            AutoRefreshLog.e(context, "WeRead popular bookmark failed bookId=${bookId.take(10)}", e)
+            LatestNoteResult(false, bookId, "", "", 0L, "${e.javaClass.simpleName}: ${e.message ?: "读取失败"}")
+        }
+    }
+
 
     private data class HttpResult(val code: Int, val body: String)
 

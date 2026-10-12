@@ -12,8 +12,8 @@ android {
         applicationId "com.dmer.neoreaderrecords"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 107
-        versionName "1.0.4"
+        versionCode 108
+        versionName "1.0.5"
         resConfigs "en", "zh-rCN", "zh-rTW"
     }
     signingConfigs {
