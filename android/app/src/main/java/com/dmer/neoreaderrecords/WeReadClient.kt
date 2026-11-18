@@ -20,11 +20,12 @@ object WeReadClient {
     private const val KEY_LAST_COVER_PATH = "weread_last_cover_path"
     private const val KEY_LAST_COVER_BYTES = "weread_last_cover_bytes"
     private const val API_GATEWAY = "https://i.weread.qq.com/api/agent/gateway"
-    // 与官方 skills/SKILL.md 核对接口契约后更新，不能自动跟随服务端版本号。
+    // 已验证的业务契约版本；不伪报远端最新版。升级通知不等于接口失败。
     private const val SKILL_VERSION = "1.0.5"
 
-    internal fun upgradeRequiredMessage(): String =
-        "微信读书接口适配需更新，请检查并安装新版阅迹壁纸后重试。当前适配版本 $SKILL_VERSION；此提示不代表 API Key 已过期，无需手动下载 Skill 文件。"
+    private fun upgradeNotice(json: JSONObject): String =
+        if (json.has("upgrade_info") && !json.isNull("upgrade_info"))
+            "\n微信有新版 Skill 提示，当前业务数据可用，已继续读取；无需手动下载文件。" else ""
 
     data class State(
         val maskedKey: String,
@@ -159,16 +160,12 @@ object WeReadClient {
                 .put("api_name", "/shelf/sync")
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val result = postJson(key, body.toString())
+            val result = postJson(context, key, body.toString())
             AutoRefreshLog.i(context, "WeRead test http code=${result.code} bytes=${result.body.length}")
             if (result.code !in 200..299) {
                 return saveFailure(context, "HTTP ${result.code}: ${result.body.take(120)}")
             }
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return saveFailure(context, upgradeRequiredMessage())
-            }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
                 return saveFailure(context, "接口错误 errcode=$errCode ${json.optString("errmsg", "").take(80)}")
@@ -185,7 +182,7 @@ object WeReadClient {
                 TestResult(
                     ok = true,
                     status = "连接成功",
-                    detail = "书架可见条目 $total 个：电子书 $bookCount，专辑/有声书 $albumCount，文章收藏 ${if (hasMp) "有" else "无"}",
+                    detail = "书架可见条目 $total 个：电子书 $bookCount，专辑/有声书 $albumCount，文章收藏 ${if (hasMp) "有" else "无"}" + upgradeNotice(json),
                     bookCount = bookCount,
                     albumCount = albumCount,
                     hasMp = hasMp
@@ -209,16 +206,12 @@ object WeReadClient {
                 .put("mode", mode)
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val result = postJson(key, body.toString())
+            val result = postJson(context, key, body.toString())
             AutoRefreshLog.i(context, "WeRead stats http mode=$mode code=${result.code} bytes=${result.body.length}")
             if (result.code !in 200..299) {
                 return ReadStatsResult(false, "读取失败", "HTTP ${result.code}: ${result.body.take(120)}", mode, 0L, 0L, 0, emptyList())
             }
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return ReadStatsResult(false, "读取失败", upgradeRequiredMessage(), mode, 0L, 0L, 0, emptyList())
-            }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
                 return ReadStatsResult(false, "读取失败", "接口错误 errcode=$errCode ${json.optString("errmsg", "").take(80)}", mode, 0L, 0L, 0, emptyList())
@@ -241,7 +234,7 @@ object WeReadClient {
                 }
             }
             val detail = "${modeLabel(mode)}：总时长 ${formatSeconds(total)}，阅读天数 ${readDays} 天，自然日均 ${formatSeconds(average)}" +
-                if (top.isEmpty()) "" else "\n排行：${top.joinToString("；")}"
+                (if (top.isEmpty()) "" else "\n排行：${top.joinToString("；")}") + upgradeNotice(json)
             AutoRefreshLog.i(context, "WeRead stats success mode=$mode total=$total readDays=$readDays top=${top.joinToString("|")}")
             ReadStatsResult(true, "读取成功", detail, mode, total, average, readDays, top)
         } catch (e: Exception) {
@@ -261,16 +254,12 @@ object WeReadClient {
                 .put("api_name", "/shelf/sync")
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val result = postJson(key, body)
+            val result = postJson(context, key, body)
             AutoRefreshLog.i(context, "WeRead cover shelf http code=${result.code} bytes=${result.body.length}")
             if (result.code !in 200..299) {
                 return CoverCacheResult(false, "缓存失败", "HTTP ${result.code}: ${result.body.take(120)}", "", "", "", "", "", 0L, false)
             }
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return CoverCacheResult(false, "缓存失败", upgradeRequiredMessage(), "", "", "", "", "", 0L, false)
-            }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
                 return CoverCacheResult(false, "缓存失败", "接口错误 errcode=$errCode ${json.optString("errmsg", "").take(80)}", "", "", "", "", "", 0L, false)
@@ -359,19 +348,11 @@ object WeReadClient {
                 .put("api_name", "/shelf/sync")
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val result = postJson(key, body)
+            val result = postJson(context, key, body)
             if (result.code !in 200..299) {
                 return ShelfSnapshotResult(false, "HTTP ${result.code}: ${result.body.take(120)}", emptyList())
             }
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return ShelfSnapshotResult(
-                    false,
-                    upgradeRequiredMessage(),
-                    emptyList()
-                )
-            }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
                 return ShelfSnapshotResult(
@@ -497,16 +478,12 @@ object WeReadClient {
             if (baseTimeSeconds != null && baseTimeSeconds > 0L && mode != "overall") {
                 body.put("baseTime", baseTimeSeconds)
             }
-            val result = postJson(key, body.toString())
+            val result = postJson(context, key, body.toString())
             AutoRefreshLog.i(context, "WeRead wallpaper stats http mode=$mode baseTime=${baseTimeSeconds ?: 0L} code=${result.code} bytes=${result.body.length}")
             if (result.code !in 200..299) {
                 return WallpaperStatsResult(false, "读取失败", "HTTP ${result.code}: ${result.body.take(120)}", mode, 0L, 0L, 0, emptyList(), emptyList())
             }
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return WallpaperStatsResult(false, "读取失败", upgradeRequiredMessage(), mode, 0L, 0L, 0, emptyList(), emptyList())
-            }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
                 return WallpaperStatsResult(false, "读取失败", "接口错误 errcode=$errCode ${json.optString("errmsg", "").take(80)}", mode, 0L, 0L, 0, emptyList(), emptyList())
@@ -563,16 +540,12 @@ object WeReadClient {
                 .put("api_name", "/book/getprogress")
                 .put("bookId", bookId)
                 .put("skill_version", SKILL_VERSION)
-            val result = postJson(key, body.toString())
+            val result = postJson(context, key, body.toString())
             AutoRefreshLog.i(context, "WeRead book progress http bookId=${bookId.take(10)} code=${result.code} bytes=${result.body.length}")
             if (result.code !in 200..299) {
                 return BookProgressResult(false, null, 0L, 0L, "HTTP ${result.code}")
             }
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return BookProgressResult(false, null, 0L, 0L, upgradeRequiredMessage())
-            }
             val errCode = json.optInt("errcode", 0)
             if (errCode != 0) {
                 return BookProgressResult(false, null, 0L, 0L, "接口错误 errcode=$errCode ${json.optString("errmsg", "").take(80)}")
@@ -601,14 +574,10 @@ object WeReadClient {
                 .put("bookId", bookId)
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val bookmarkResult = postJson(key, bookmarkBody)
+            val bookmarkResult = postJson(context, key, bookmarkBody)
             AutoRefreshLog.i(context, "WeRead latest note bookmarks http bookId=${bookId.take(10)} code=${bookmarkResult.code} bytes=${bookmarkResult.body.length}")
             if (bookmarkResult.code in 200..299) {
                 val json = JSONObject(bookmarkResult.body)
-                val upgradeInfo = json.optJSONObject("upgrade_info")
-                if (upgradeInfo != null) {
-                    return LatestNoteResult(false, bookId, "", "", 0L, upgradeRequiredMessage())
-                }
                 if (json.optInt("errcode", 0) == 0) {
                     val updated = json.optJSONArray("updated")
                     if (updated != null) {
@@ -628,14 +597,10 @@ object WeReadClient {
                 .put("count", 20)
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val reviewResult = postJson(key, reviewBody)
+            val reviewResult = postJson(context, key, reviewBody)
             AutoRefreshLog.i(context, "WeRead latest note reviews http bookId=${bookId.take(10)} code=${reviewResult.code} bytes=${reviewResult.body.length}")
             if (reviewResult.code in 200..299) {
                 val json = JSONObject(reviewResult.body)
-                val upgradeInfo = json.optJSONObject("upgrade_info")
-                if (upgradeInfo != null) {
-                    return LatestNoteResult(false, bookId, "", "", 0L, upgradeRequiredMessage())
-                }
                 if (json.optInt("errcode", 0) == 0) {
                     val reviews = json.optJSONArray("reviews")
                     if (reviews != null) {
@@ -668,14 +633,10 @@ object WeReadClient {
                 .put("chapterUid", 0)
                 .put("skill_version", SKILL_VERSION)
                 .toString()
-            val result = postJson(key, body)
+            val result = postJson(context, key, body)
             AutoRefreshLog.i(context, "WeRead popular bookmark http bookId=${bookId.take(10)} code=${result.code} bytes=${result.body.length}")
             if (result.code !in 200..299) return LatestNoteResult(false, bookId, "", "", 0L, "HTTP ${result.code}")
             val json = JSONObject(result.body)
-            val upgradeInfo = json.optJSONObject("upgrade_info")
-            if (upgradeInfo != null) {
-                return LatestNoteResult(false, bookId, "", "", 0L, upgradeRequiredMessage())
-            }
             if (json.optInt("errcode", 0) != 0) {
                 return LatestNoteResult(false, bookId, "", "", 0L, "接口错误 errcode=${json.optInt("errcode", 0)}")
             }
@@ -700,7 +661,7 @@ object WeReadClient {
 
     private data class HttpResult(val code: Int, val body: String)
 
-    private fun postJson(apiKey: String, body: String): HttpResult {
+    private fun postJson(context: Context, apiKey: String, body: String): HttpResult {
         val conn = (URL(API_GATEWAY).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 10_000
@@ -715,7 +676,17 @@ object WeReadClient {
             conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
             val code = conn.responseCode
             val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-            HttpResult(code, stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty())
+            val response = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            if (code in 200..299) {
+                val api = JSONObject(body).getString("api_name")
+                val json = JSONObject(response)
+                WeReadResponsePolicy.validate(api, json)
+                if (upgradeNotice(json).isNotEmpty()) {
+                    // 不记录远端message/url或完整响应，避免泄漏及执行不可信指令。
+                    AutoRefreshLog.i(context, "WeRead upgrade notice non-blocking api=$api reported=$SKILL_VERSION business=valid")
+                }
+            }
+            HttpResult(code, response)
         } finally {
             conn.disconnect()
         }
