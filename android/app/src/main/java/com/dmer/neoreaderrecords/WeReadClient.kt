@@ -21,7 +21,7 @@ object WeReadClient {
     private const val KEY_LAST_COVER_BYTES = "weread_last_cover_bytes"
     private const val API_GATEWAY = "https://i.weread.qq.com/api/agent/gateway"
     // 已验证的业务契约版本；不伪报远端最新版。升级通知不等于接口失败。
-    private const val SKILL_VERSION = "1.0.5"
+    private const val SKILL_VERSION = "1.0.6"
 
     private fun upgradeNotice(json: JSONObject): String =
         if (json.has("upgrade_info") && !json.isNull("upgrade_info"))
